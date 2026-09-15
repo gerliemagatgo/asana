@@ -86,10 +86,51 @@ app.get('/api/tasks', requireAccessCode, async (req, res) => {
   }
 });
 
+// List members of the default project, for the optional "assign to" dropdown.
+app.get('/api/members', requireAccessCode, async (req, res) => {
+  if (isDryRun) {
+    return res.json({
+      members: [
+        { gid: 'demo-user-1', name: '(dry run) Gerlie' },
+        { gid: 'demo-user-2', name: '(dry run) Katie' },
+      ],
+    });
+  }
+
+  if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return serverMisconfigured(res);
+
+  try {
+    const url = `${ASANA_API}/projects/${ASANA_PROJECT_GID}?opt_fields=members.name,members.gid`;
+    const r = await fetch(url, { headers: asanaHeaders() });
+    const body = await r.json();
+
+    if (!r.ok) {
+      const message = body?.errors?.[0]?.message || 'Asana rejected the request.';
+      return res.status(r.status).json({ error: message });
+    }
+
+    const members = (body.data?.members || []).map((m) => ({ gid: m.gid, name: m.name }));
+    res.json({ members });
+  } catch (err) {
+    console.error('GET /api/members failed:', err);
+    res.status(502).json({ error: 'Could not reach Asana. Try again in a moment.' });
+  }
+});
+
+// Builds the {assignee, due_on} fields to merge into an Asana payload,
+// omitting anything the caller didn't actually set.
+function optionalTaskFields(assigneeGid, dueDate) {
+  const fields = {};
+  if (assigneeGid) fields.assignee = assigneeGid;
+  if (dueDate) fields.due_on = dueDate; // expects YYYY-MM-DD
+  return fields;
+}
+
 // Either comment on an existing task (taskGid provided) or create a new one
-// in the default project (taskGid omitted).
+// in the default project (taskGid omitted). assigneeGid and dueDate are both
+// optional in either case.
 app.post('/api/submit', requireAccessCode, async (req, res) => {
-  const { taskGid, text } = req.body || {};
+  const { taskGid, text, assigneeGid, dueDate } = req.body || {};
   const trimmed = (text || '').trim();
 
   if (!trimmed) {
@@ -97,7 +138,12 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
   }
 
   if (isDryRun) {
-    console.log('[DRY RUN] Would send to Asana:', { taskGid: taskGid || null, text: trimmed });
+    console.log('[DRY RUN] Would send to Asana:', {
+      taskGid: taskGid || null,
+      text: trimmed,
+      assigneeGid: assigneeGid || null,
+      dueDate: dueDate || null,
+    });
     return res.json({ ok: true, dryRun: true, taskGid: taskGid || 'demo-new-task' });
   }
 
@@ -121,6 +167,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
           name,
           notes: trimmed,
           projects: [ASANA_PROJECT_GID],
+          ...optionalTaskFields(assigneeGid, dueDate),
         },
       };
     }
@@ -137,7 +184,27 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       return res.status(r.status).json({ error: message });
     }
 
-    res.json({ ok: true, taskGid: body?.data?.gid || taskGid || null });
+    const resultGid = body?.data?.gid || taskGid || null;
+    let warning = null;
+
+    // Commenting doesn't let you set assignee/due date in the same call, so
+    // an existing ticket needs a second request to apply those, if given.
+    if (taskGid && (assigneeGid || dueDate)) {
+      const updateFields = optionalTaskFields(assigneeGid, dueDate);
+      const updateR = await fetch(`${ASANA_API}/tasks/${taskGid}`, {
+        method: 'PUT',
+        headers: asanaHeaders(),
+        body: JSON.stringify({ data: updateFields }),
+      });
+      if (!updateR.ok) {
+        const updateBody = await updateR.json().catch(() => ({}));
+        warning =
+          'Comment was added, but could not update assignee/due date: ' +
+          (updateBody?.errors?.[0]?.message || 'Asana rejected the request.');
+      }
+    }
+
+    res.json({ ok: true, taskGid: resultGid, warning });
   } catch (err) {
     console.error('POST /api/submit failed:', err);
     res.status(502).json({ error: 'Could not reach Asana. Try again in a moment.' });
