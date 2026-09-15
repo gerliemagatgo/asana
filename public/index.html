@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Quick Update</title>
+
+<!-- Lets this behave like a lightweight app when added to the iPhone home screen -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Quick Update" />
+<meta name="theme-color" content="#151515" />
+
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f3f0;
+    --card: #ffffff;
+    --ink: #17171a;
+    --muted: #6b6b70;
+    --accent: #d1495b;
+    --accent-ink: #ffffff;
+    --border: #e4e2dd;
+    --ok: #2f8f5b;
+    --err: #c23b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121214;
+      --card: #1c1c1f;
+      --ink: #f2f1ee;
+      --muted: #9a9a9e;
+      --border: #2c2c30;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    min-height: 100vh;
+    padding: max(20px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+    display: flex;
+    justify-content: center;
+  }
+  main {
+    width: 100%;
+    max-width: 480px;
+  }
+  h1 {
+    font-size: 1.3rem;
+    margin: 4px 0 2px;
+  }
+  .sub {
+    color: var(--muted);
+    font-size: 0.92rem;
+    margin: 0 0 20px;
+    line-height: 1.4;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  label {
+    display: block;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 8px;
+  }
+  textarea {
+    width: 100%;
+    min-height: 140px;
+    resize: vertical;
+    font-size: 1.05rem;
+    line-height: 1.45;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--ink);
+    font-family: inherit;
+  }
+  textarea:focus, select:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .mic-hint {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  select {
+    width: 100%;
+    font-size: 1rem;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--ink);
+    margin-top: 16px;
+  }
+  button {
+    width: 100%;
+    margin-top: 18px;
+    padding: 16px;
+    font-size: 1.05rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 12px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    cursor: pointer;
+  }
+  button:disabled {
+    opacity: 0.55;
+  }
+  button:active {
+    transform: scale(0.99);
+  }
+  .status {
+    margin-top: 14px;
+    font-size: 0.92rem;
+    min-height: 1.2em;
+  }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+  .footer-link {
+    text-align: center;
+    margin-top: 6px;
+  }
+  .footer-link button {
+    all: unset;
+    color: var(--muted);
+    font-size: 0.8rem;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  /* Access-code gate */
+  #gate {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 10;
+  }
+  #gate .card { width: 100%; max-width: 360px; }
+  #gate input {
+    width: 100%;
+    font-size: 1.1rem;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--ink);
+    margin-bottom: 12px;
+    text-align: center;
+    letter-spacing: 0.08em;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="card">
+    <h1>Quick Update</h1>
+    <p class="sub">Enter the access code once — this device will remember it.</p>
+    <input id="gateInput" type="password" inputmode="text" placeholder="Access code" autocomplete="off" />
+    <button id="gateSubmit">Unlock</button>
+    <p class="status err" id="gateStatus"></p>
+  </div>
+</div>
+
+<main id="app" class="hidden">
+  <h1>Quick Update</h1>
+  <p class="sub">Tap the box, then tap the microphone key on your keyboard and talk. Pick an existing ticket to add this as a comment, or leave it as new.</p>
+
+  <div class="card">
+    <label for="text">What's the update?</label>
+    <textarea id="text" placeholder="Talked to Keith — he wants to revisit pricing in Q1, follow up mid-Jan…" autofocus></textarea>
+    <div class="mic-hint">🎙️ Tap the mic on your keyboard to dictate instead of typing.</div>
+
+    <label for="ticket" style="margin-top:18px;">Ticket</label>
+    <select id="ticket">
+      <option value="">➕ Create a new ticket</option>
+    </select>
+
+    <button id="submit">Send to Asana</button>
+    <p class="status" id="status"></p>
+  </div>
+
+  <p class="footer-link"><button id="resetCode">Change access code</button></p>
+</main>
+
+<script>
+  const STORAGE_KEY = 'voiceToAsana.accessCode';
+  const gate = document.getElementById('gate');
+  const app = document.getElementById('app');
+  const gateInput = document.getElementById('gateInput');
+  const gateSubmit = document.getElementById('gateSubmit');
+  const gateStatus = document.getElementById('gateStatus');
+  const textEl = document.getElementById('text');
+  const ticketEl = document.getElementById('ticket');
+  const submitBtn = document.getElementById('submit');
+  const statusEl = document.getElementById('status');
+  const resetCodeBtn = document.getElementById('resetCode');
+
+  function getCode() {
+    return localStorage.getItem(STORAGE_KEY) || '';
+  }
+
+  function headers() {
+    const h = { 'Content-Type': 'application/json' };
+    const code = getCode();
+    if (code) h['x-access-code'] = code;
+    return h;
+  }
+
+  async function loadTickets() {
+    try {
+      const r = await fetch('/api/tasks', { headers: headers() });
+      if (r.status === 401) return unlock(false);
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error || 'Could not load tickets.');
+      for (const t of body.tasks || []) {
+        const opt = document.createElement('option');
+        opt.value = t.gid;
+        opt.textContent = t.name;
+        ticketEl.appendChild(opt);
+      }
+    } catch (err) {
+      // Non-fatal — you can still create a new ticket even if the list fails.
+      console.warn(err);
+    }
+  }
+
+  function unlock(show) {
+    if (show) {
+      gate.classList.add('hidden');
+      app.classList.remove('hidden');
+      loadTickets();
+    } else {
+      gate.classList.remove('hidden');
+      app.classList.add('hidden');
+    }
+  }
+
+  gateSubmit.addEventListener('click', async () => {
+    const code = gateInput.value.trim();
+    if (!code) return;
+    localStorage.setItem(STORAGE_KEY, code);
+    const check = await fetch('/api/tasks', { headers: headers() });
+    if (check.status === 401) {
+      gateStatus.textContent = 'That code was rejected. Try again.';
+      localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
+    gateStatus.textContent = '';
+    unlock(true);
+  });
+
+  resetCodeBtn.addEventListener('click', () => {
+    localStorage.removeItem(STORAGE_KEY);
+    ticketEl.innerHTML = '<option value="">➕ Create a new ticket</option>';
+    gateInput.value = '';
+    unlock(false);
+  });
+
+  submitBtn.addEventListener('click', async () => {
+    const text = textEl.value.trim();
+    if (!text) {
+      statusEl.textContent = 'Say or type something first.';
+      statusEl.className = 'status err';
+      return;
+    }
+    submitBtn.disabled = true;
+    statusEl.textContent = 'Sending…';
+    statusEl.className = 'status';
+    try {
+      const r = await fetch('/api/submit', {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ text, taskGid: ticketEl.value || null }),
+      });
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error || 'Something went wrong.');
+      statusEl.textContent = ticketEl.value
+        ? 'Added as a comment ✓'
+        : 'New ticket created ✓';
+      statusEl.className = 'status ok';
+      textEl.value = '';
+    } catch (err) {
+      statusEl.textContent = err.message || 'Could not send that. Try again.';
+      statusEl.className = 'status err';
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
+  // On load: if we already have a saved code, skip straight to the app.
+  (async function init() {
+    if (!getCode()) return unlock(false);
+    const check = await fetch('/api/tasks', { headers: headers() });
+    if (check.status === 401) {
+      localStorage.removeItem(STORAGE_KEY);
+      return unlock(false);
+    }
+    unlock(true);
+  })();
+</script>
+</body>
+</html>
