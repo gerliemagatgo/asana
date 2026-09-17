@@ -315,39 +315,55 @@ async function summarizeUpdate(text, members, sections) {
   };
 }
 
-// Lighter-weight version used when adding a comment to an existing ticket —
-// no title/description needed, just checks whether the note mentions an
-// assignee or due date that wasn't already picked manually in the app.
-async function extractAssigneeAndDueDate(text, members) {
+// Used when a dictated note is being added to an EXISTING ticket. Rather than
+// always just bolting the note on as a comment, this assesses whether it
+// actually calls for updating the task (assignee, due date, marking it
+// complete) and whether it's worth logging as a comment at all, or if it's
+// purely a bare instruction with nothing else to record.
+async function assessExistingTicketUpdate(text, members) {
   const parsed = await callClaudeJson(
-    'A note is being added as a comment on an existing task. The text was produced by ' +
+    'A dictated voice-note is being added to an existing task. The text was produced by ' +
       'speech-to-text from a voicemail, so expect imperfect transcription: misheard or ' +
       'phonetically-spelled names, dropped/wrong words, odd punctuation. Do your best to ' +
-      'understand the intended meaning anyway. Check whether it mentions who the task ' +
-      'should be assigned to and/or a due date. Reply with ONLY raw compact JSON and ' +
-      'nothing else — no markdown, no code fences, no commentary: ' +
-      '{"assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null}. ' +
-      'If a person is named, match them against this exact member list and return their ' +
-      'gid — match by sound-alike/phonetic similarity too (e.g. "Katy", "Cady", "Katie" ' +
-      'should all match a member named "Katie"), but never invent a gid and never guess if ' +
-      `genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
-      `Today is ${todayContext()}, for resolving relative dates like "Friday" or "next week". ` +
-      'If nothing is said about either, return both as null.',
+      'understand the intended meaning anyway. ' +
+      'Assess four things about this note. Reply with ONLY raw compact JSON and nothing ' +
+      'else — no markdown, no code fences, no commentary before or after it: ' +
+      '{"assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "markComplete": true or false, "shouldComment": true or false}. ' +
+      'assigneeGid: if the note names who this should be assigned to, match them against ' +
+      'this exact member list and return their gid — match by sound-alike/phonetic ' +
+      'similarity too (e.g. "Katy", "Cady", "Katie" should all match a member named ' +
+      `"Katie"), but never invent a gid and never guess if genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
+      'dueDate: if the note mentions a due date (e.g. "by Friday", "next week"), resolve it ' +
+      `to an actual date. Today is ${todayContext()}. ` +
+      'markComplete: true only if the note clearly says this task is done, finished, ' +
+      'completed, resolved, or no longer needed (e.g. "this is done", "already took care of ' +
+      'it", "go ahead and close this out") — false otherwise, and false whenever it is at ' +
+      'all ambiguous. ' +
+      'shouldComment: whether this note contains real context, detail, or information worth ' +
+      'keeping as a permanent record on the task — true in almost every case. Set it to ' +
+      'false ONLY when the note is purely a bare instruction with nothing else worth ' +
+      'logging (e.g. it is just "assign this to Katie", or just "mark this done", or just ' +
+      '"due Friday", and genuinely nothing more). When in doubt, set shouldComment to true — ' +
+      'it is always safer to keep a record than to silently lose one.',
     text
   );
 
   return {
     assigneeGid: parsed?.assigneeGid || null,
     dueDate: parsed?.dueDate || null,
+    markComplete: parsed?.markComplete === true,
+    shouldComment: parsed?.shouldComment !== false,
   };
 }
 
-// Builds the {assignee, due_on} fields to merge into an Asana payload,
-// omitting anything the caller didn't actually set.
-function optionalTaskFields(assigneeGid, dueDate) {
+// Builds the {assignee, due_on, completed} fields to merge into an Asana
+// payload, omitting anything the caller didn't actually set. Only ever sets
+// completed to true (marking done) — never used to reopen a task.
+function optionalTaskFields(assigneeGid, dueDate, completed) {
   const fields = {};
   if (assigneeGid) fields.assignee = assigneeGid;
   if (dueDate) fields.due_on = dueDate; // expects YYYY-MM-DD
+  if (completed) fields.completed = true;
   return fields;
 }
 
@@ -357,8 +373,8 @@ function mergeField(explicitValue, aiValue) {
   return explicitValue || aiValue || null;
 }
 
-// Either comment on an existing task (taskGid provided) or create a new one
-// in the default project (taskGid omitted). assigneeGid and dueDate are both
+// Either update an existing task (taskGid provided) or create a new one in
+// the default project (taskGid omitted). assigneeGid and dueDate are both
 // optional in either case, and can come from the UI, from AI reading the
 // dictated text, or both (UI wins on conflict).
 app.post('/api/submit', requireAccessCode, async (req, res) => {
@@ -371,82 +387,128 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
 
   if (isDryRun) {
     const members = await getProjectMembers();
-    const sections = await getProjectSections();
-    const preview = await summarizeUpdate(trimmed, members, sections);
-    const finalAssigneeGid = mergeField(assigneeGid, taskGid ? null : preview.assigneeGid);
-    const finalDueDate = mergeField(dueDate, taskGid ? null : preview.dueDate);
-    console.log('[DRY RUN] Would send to Asana:', {
-      taskGid: taskGid || null,
-      text: trimmed,
-      assigneeGid: finalAssigneeGid,
-      dueDate: finalDueDate,
-      wouldUseTitle: taskGid ? null : preview.title,
-      wouldUseDescription: taskGid ? null : preview.description,
-      wouldUseSectionGid: taskGid ? null : preview.sectionGid,
-    });
+    if (taskGid) {
+      const assessed = await assessExistingTicketUpdate(trimmed, members);
+      console.log('[DRY RUN] Would update existing ticket:', {
+        taskGid,
+        text: trimmed,
+        assigneeGid: mergeField(assigneeGid, assessed.assigneeGid),
+        dueDate: mergeField(dueDate, assessed.dueDate),
+        markComplete: assessed.markComplete,
+        shouldComment: assessed.shouldComment,
+      });
+    } else {
+      const sections = await getProjectSections();
+      const preview = await summarizeUpdate(trimmed, members, sections);
+      console.log('[DRY RUN] Would create new ticket:', {
+        text: trimmed,
+        assigneeGid: mergeField(assigneeGid, preview.assigneeGid),
+        dueDate: mergeField(dueDate, preview.dueDate),
+        wouldUseTitle: preview.title,
+        wouldUseDescription: preview.description,
+        wouldUseSectionGid: preview.sectionGid,
+      });
+    }
     return res.json({ ok: true, dryRun: true, taskGid: taskGid || 'demo-new-task' });
   }
 
   if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return serverMisconfigured(res);
 
   try {
-    let url;
-    let payload;
-    let finalAssigneeGid = assigneeGid || null;
-    let finalDueDate = dueDate || null;
-
     if (taskGid) {
-      // Add as a comment on the chosen existing ticket. No title needed here,
-      // so no summarization call — just the raw text as-is. Only bother asking
-      // AI to check for an assignee/due date if the person didn't already set
-      // both manually — no point spending a call when there's nothing to add.
-      if (!assigneeGid || !dueDate) {
-        const members = await getProjectMembers();
-        const inferred = await extractAssigneeAndDueDate(trimmed, members);
-        finalAssigneeGid = mergeField(assigneeGid, inferred.assigneeGid);
-        finalDueDate = mergeField(dueDate, inferred.dueDate);
-      }
-      url = `${ASANA_API}/tasks/${taskGid}/stories`;
-      payload = { data: { text: trimmed } };
-    } else {
-      // Create a brand-new ticket. Let Claude split this into a short title
-      // + a cleaned-up description, pick up any assignee/due-date mention,
-      // and categorize it into a section when it's configured and within
-      // budget; otherwise plainSplit() inside summarizeUpdate() covers it
-      // seamlessly (new ticket lands with no section, which is the safe
-      // default when nothing can be inferred).
+      // Existing ticket: assess what the note actually calls for, rather
+      // than always just bolting it on as a comment — it might be assigning
+      // it, setting a due date, marking it complete, or some combination,
+      // with or without anything worth logging as a comment too.
       const members = await getProjectMembers();
-      const sections = await getProjectSections();
-      const {
-        title,
-        description,
-        assigneeGid: aiAssigneeGid,
-        dueDate: aiDueDate,
-        sectionGid,
-      } = await summarizeUpdate(trimmed, members, sections);
-      finalAssigneeGid = mergeField(assigneeGid, aiAssigneeGid);
-      finalDueDate = mergeField(dueDate, aiDueDate);
-      url = `${ASANA_API}/tasks`;
-      payload = {
-        data: {
-          name: title,
-          notes: description,
-          // `projects` is required on every create call (Asana needs it to
-          // infer the workspace) — `memberships` is an *additional* hint on
-          // top of that which places the task directly into a section when
-          // we have a confident match; otherwise it just lands in the
-          // project with no section (the default/uncategorized area), per
-          // "if unsure, don't put it in any section."
-          projects: [ASANA_PROJECT_GID],
-          ...(sectionGid
-            ? { memberships: [{ project: ASANA_PROJECT_GID, section: sectionGid }] }
-            : {}),
-          ...optionalTaskFields(finalAssigneeGid, finalDueDate),
-        },
-      };
+      const assessed = await assessExistingTicketUpdate(trimmed, members);
+      const finalAssigneeGid = mergeField(assigneeGid, assessed.assigneeGid);
+      const finalDueDate = mergeField(dueDate, assessed.dueDate);
+      const markComplete = assessed.markComplete === true;
+      const hasOtherAction = Boolean(finalAssigneeGid || finalDueDate || markComplete);
+      // Never silently drop the note — if nothing else is happening as a
+      // result of it, always keep a record via a comment regardless of what
+      // the AI decided.
+      const shouldComment = assessed.shouldComment !== false || !hasOtherAction;
+
+      const actions = [];
+      let warning = null;
+
+      if (shouldComment) {
+        const storyR = await fetch(`${ASANA_API}/tasks/${taskGid}/stories`, {
+          method: 'POST',
+          headers: asanaHeaders(),
+          body: JSON.stringify({ data: { text: trimmed } }),
+        });
+        if (!storyR.ok) {
+          const storyBody = await storyR.json().catch(() => ({}));
+          return res.status(storyR.status).json({
+            error: storyBody?.errors?.[0]?.message || 'Asana rejected the comment.',
+          });
+        }
+        actions.push('commented');
+      }
+
+      const updateFields = optionalTaskFields(finalAssigneeGid, finalDueDate, markComplete);
+      if (Object.keys(updateFields).length) {
+        const updateR = await fetch(`${ASANA_API}/tasks/${taskGid}`, {
+          method: 'PUT',
+          headers: asanaHeaders(),
+          body: JSON.stringify({ data: updateFields }),
+        });
+        if (!updateR.ok) {
+          const updateBody = await updateR.json().catch(() => ({}));
+          warning =
+            (shouldComment ? 'Comment was added, but c' : 'C') +
+            'ould not apply the update: ' +
+            (updateBody?.errors?.[0]?.message || 'Asana rejected the request.');
+        } else {
+          if (finalAssigneeGid) actions.push('assigned');
+          if (finalDueDate) actions.push('due date set');
+          if (markComplete) actions.push('marked complete');
+        }
+      }
+
+      return res.json({ ok: true, taskGid, warning, actions });
     }
 
-    const r = await fetch(url, {
+    // Create a brand-new ticket. Let Claude split this into a short title +
+    // a cleaned-up description, pick up any assignee/due-date mention, and
+    // categorize it into a section when it's configured and within budget;
+    // otherwise plainSplit() inside summarizeUpdate() covers it seamlessly
+    // (new ticket lands with no section, which is the safe default when
+    // nothing can be inferred).
+    const members = await getProjectMembers();
+    const sections = await getProjectSections();
+    const {
+      title,
+      description,
+      assigneeGid: aiAssigneeGid,
+      dueDate: aiDueDate,
+      sectionGid,
+    } = await summarizeUpdate(trimmed, members, sections);
+    const finalAssigneeGid = mergeField(assigneeGid, aiAssigneeGid);
+    const finalDueDate = mergeField(dueDate, aiDueDate);
+
+    const payload = {
+      data: {
+        name: title,
+        notes: description,
+        // `projects` is required on every create call (Asana needs it to
+        // infer the workspace) — `memberships` is an *additional* hint on
+        // top of that which places the task directly into a section when
+        // we have a confident match; otherwise it just lands in the
+        // project with no section (the default/uncategorized area), per
+        // "if unsure, don't put it in any section."
+        projects: [ASANA_PROJECT_GID],
+        ...(sectionGid
+          ? { memberships: [{ project: ASANA_PROJECT_GID, section: sectionGid }] }
+          : {}),
+        ...optionalTaskFields(finalAssigneeGid, finalDueDate),
+      },
+    };
+
+    const r = await fetch(`${ASANA_API}/tasks`, {
       method: 'POST',
       headers: asanaHeaders(),
       body: JSON.stringify(payload),
@@ -458,28 +520,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       return res.status(r.status).json({ error: message });
     }
 
-    const resultGid = body?.data?.gid || taskGid || null;
-    let warning = null;
-
-    // Commenting doesn't let you set assignee/due date in the same call, so
-    // an existing ticket needs a second request to apply those, if given
-    // (either picked manually in the UI or inferred by AI above).
-    if (taskGid && (finalAssigneeGid || finalDueDate)) {
-      const updateFields = optionalTaskFields(finalAssigneeGid, finalDueDate);
-      const updateR = await fetch(`${ASANA_API}/tasks/${taskGid}`, {
-        method: 'PUT',
-        headers: asanaHeaders(),
-        body: JSON.stringify({ data: updateFields }),
-      });
-      if (!updateR.ok) {
-        const updateBody = await updateR.json().catch(() => ({}));
-        warning =
-          'Comment was added, but could not update assignee/due date: ' +
-          (updateBody?.errors?.[0]?.message || 'Asana rejected the request.');
-      }
-    }
-
-    res.json({ ok: true, taskGid: resultGid, warning });
+    res.json({ ok: true, taskGid: body?.data?.gid || null, warning: null, actions: ['created'] });
   } catch (err) {
     console.error('POST /api/submit failed:', err);
     res.status(502).json({ error: 'Could not reach Asana. Try again in a moment.' });
