@@ -251,6 +251,21 @@
     return h;
   }
 
+  // Turns the backend's list of what actually happened (e.g. ['assigned',
+  // 'marked complete']) into a readable status line, so the app is honest
+  // about whether a comment was added, skipped, or something else changed.
+  function describeActions(actions) {
+    const labels = {
+      created: 'New ticket created',
+      commented: 'Added as a comment',
+      assigned: 'Assigned',
+      'due date set': 'Due date set',
+      'marked complete': 'Marked complete',
+    };
+    if (!actions || !actions.length) return 'Updated';
+    return actions.map((a) => labels[a] || a).join(' · ');
+  }
+
   async function loadTickets() {
     try {
       const r = await fetch('/api/tasks', { headers: headers() });
@@ -345,10 +360,8 @@
       const body = await r.json();
       if (!r.ok) throw new Error(body.error || 'Something went wrong.');
       statusEl.textContent = body.warning
-        ? `${ticketEl.value ? 'Added as a comment' : 'New ticket created'} — ${body.warning}`
-        : ticketEl.value
-        ? 'Added as a comment ✓'
-        : 'New ticket created ✓';
+        ? `${describeActions(body.actions)} — ${body.warning}`
+        : `${describeActions(body.actions)} ✓`;
       statusEl.className = body.warning ? 'status err' : 'status ok';
       textEl.value = '';
     } catch (err) {
