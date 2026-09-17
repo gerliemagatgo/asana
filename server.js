@@ -162,6 +162,27 @@ function todayContext() {
   return `${now.toDateString()} (i.e. ${now.toISOString().slice(0, 10)})`;
 }
 
+// Claude sometimes wraps JSON replies in a ```json ... ``` code fence even
+// when told not to. Strip that, then fall back to grabbing the outermost
+// {...} block, so a stray fence or a stray word never breaks JSON.parse.
+function parseJsonLoose(raw) {
+  let text = String(raw || '').trim();
+  text = text.replace(/^```[a-z]*\s*/i, '').replace(/```\s*$/i, '').trim();
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch (err2) {
+        // fall through to the throw below
+      }
+    }
+    throw err;
+  }
+}
+
 // Calls Claude once and returns parsed JSON, or null on any failure. Shared
 // by summarizeUpdate() and extractAssigneeAndDueDate() below — both always
 // fall back to non-AI behavior on null rather than ever blocking a submission.
@@ -190,7 +211,7 @@ async function callClaudeJson(system, userText) {
 
     const body = await r.json();
     const raw = body?.content?.[0]?.text || '';
-    return JSON.parse(raw);
+    return parseJsonLoose(raw);
   } catch (err) {
     console.error('Claude call failed, falling back to non-AI behavior:', err);
     return null;
@@ -204,13 +225,20 @@ async function summarizeUpdate(text, members) {
   const parsed = await callClaudeJson(
     'You turn a dictated voice-note update into a task title and description, and ' +
       'pick up on any assignment/due-date instructions in the same note. ' +
-      'Reply with ONLY compact JSON: ' +
+      'The text was produced by speech-to-text from a voicemail, so expect imperfect ' +
+      'transcription: misheard or phonetically-spelled names, dropped/wrong words, run-on ' +
+      'sentences, and odd punctuation. Do your best to understand the intended meaning ' +
+      'anyway rather than taking the literal wording too strictly. ' +
+      'Reply with ONLY raw compact JSON and nothing else — no markdown, no code fences, ' +
+      'no commentary before or after it: ' +
       '{"title": "...", "description": "...", "assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null}. ' +
       'The title is a short, specific summary (under 10 words, no trailing period). ' +
       'The description is the full context, lightly cleaned up (fix filler words/false ' +
-      'starts) but keeping every real detail — do not summarize the description, only the ' +
-      'title. If the note names who this should be assigned to, match them against this ' +
-      `exact member list and return their gid (never invent a gid, never guess if unclear):\n${membersForPrompt(members)}\n` +
+      'starts/transcription glitches) but keeping every real detail — do not summarize the ' +
+      'description, only the title. If the note names who this should be assigned to, match ' +
+      'them against this exact member list and return their gid — match by sound-alike/' +
+      'phonetic similarity too (e.g. "Katy", "Cady", "Katie" should all match a member named ' +
+      `"Katie"), but never invent a gid and never guess if genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
       'If the note mentions a due date (e.g. "by Friday", "next week", "end of month"), ' +
       `resolve it to an actual date. Today is ${todayContext()}. ` +
       'If nothing is said about who it is for or when it is due, leave those fields null — ' +
@@ -233,11 +261,17 @@ async function summarizeUpdate(text, members) {
 // assignee or due date that wasn't already picked manually in the app.
 async function extractAssigneeAndDueDate(text, members) {
   const parsed = await callClaudeJson(
-    'A note is being added as a comment on an existing task. Check whether it mentions ' +
-      'who the task should be assigned to and/or a due date. Reply with ONLY compact JSON: ' +
+    'A note is being added as a comment on an existing task. The text was produced by ' +
+      'speech-to-text from a voicemail, so expect imperfect transcription: misheard or ' +
+      'phonetically-spelled names, dropped/wrong words, odd punctuation. Do your best to ' +
+      'understand the intended meaning anyway. Check whether it mentions who the task ' +
+      'should be assigned to and/or a due date. Reply with ONLY raw compact JSON and ' +
+      'nothing else — no markdown, no code fences, no commentary: ' +
       '{"assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null}. ' +
       'If a person is named, match them against this exact member list and return their ' +
-      `gid (never invent a gid, never guess if unclear):\n${membersForPrompt(members)}\n` +
+      'gid — match by sound-alike/phonetic similarity too (e.g. "Katy", "Cady", "Katie" ' +
+      'should all match a member named "Katie"), but never invent a gid and never guess if ' +
+      `genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
       `Today is ${todayContext()}, for resolving relative dates like "Friday" or "next week". ` +
       'If nothing is said about either, return both as null.',
     text
