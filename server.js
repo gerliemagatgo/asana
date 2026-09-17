@@ -141,13 +141,57 @@ app.get('/api/members', requireAccessCode, async (req, res) => {
   }
 });
 
+// Fetches the default project's actual sections, so the AI can be told the
+// real ones instead of guessing at names.
+async function getProjectSections() {
+  if (isDryRun) {
+    return [
+      { gid: 'demo-section-admin', name: 'Admin' },
+      { gid: 'demo-section-adhoc', name: 'Ad Hoc' },
+      { gid: 'demo-section-recurring', name: 'Recurring Appointments' },
+    ];
+  }
+  if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return [];
+
+  const url = `${ASANA_API}/projects/${ASANA_PROJECT_GID}/sections?opt_fields=name,gid`;
+  const r = await fetch(url, { headers: asanaHeaders() });
+  if (!r.ok) return [];
+  const body = await r.json();
+  return (body.data || []).map((s) => ({ gid: s.gid, name: s.name }));
+}
+
+// Only auto-categorize into these three specific buckets, matched by keyword
+// against the project's real section names (so it adapts if they're renamed,
+// but never invents a section that doesn't exist). Anything else — Aspen
+// Office, Turo, Travel, etc. — is intentionally left alone; those aren't
+// meant to be auto-picked by dictated updates.
+function categorizableSections(sections) {
+  const byKeyword = (keyword) =>
+    sections.find((s) => s.name.toLowerCase().replace(/\s+/g, '').includes(keyword));
+
+  const admin = byKeyword('admin');
+  const adHoc = byKeyword('adhoc');
+  const recurring = byKeyword('recurring');
+
+  const result = [];
+  if (admin) result.push({ ...admin, category: 'admin tasks (paperwork, scheduling, policy/business admin work)' });
+  if (adHoc) result.push({ ...adHoc, category: 'random one-off / miscellaneous tasks' });
+  if (recurring) result.push({ ...recurring, category: 'any kind of recurring personal appointment (medical, grooming, subscriptions, etc.)' });
+  return result;
+}
+
+function sectionsForPrompt(categorized) {
+  if (!categorized.length) return '(no matching sections available — always leave sectionGid null)';
+  return categorized.map((s) => `"${s.name}" — use for ${s.category} (gid: ${s.gid})`).join('\n');
+}
+
 // Falls back to the old behavior: first ~100 chars as the title, full text
-// as the description, no assignee/due date guessed. Used whenever AI
+// as the description, no assignee/due date/section guessed. Used whenever AI
 // summarization isn't available, hasn't been configured, is over its daily
 // budget, or fails for any reason.
 function plainSplit(text) {
   const name = text.length > 100 ? `${text.slice(0, 97)}...` : text;
-  return { title: name, description: text, assigneeGid: null, dueDate: null };
+  return { title: name, description: text, assigneeGid: null, dueDate: null, sectionGid: null };
 }
 
 // Formats the member list into "Name (gid: 123)" lines so Claude can match a
@@ -220,18 +264,20 @@ async function callClaudeJson(system, userText) {
 
 // Asks Claude for a short title + cleaned-up description from a raw dictated
 // update, and — since the same note often says who it's for or when it's
-// due — also pulls out an assignee and due date if they were mentioned.
-async function summarizeUpdate(text, members) {
+// due, or clearly reads as one of a few known task categories — also pulls
+// out an assignee, due date, and section if they apply.
+async function summarizeUpdate(text, members, sections) {
+  const categorized = categorizableSections(sections);
   const parsed = await callClaudeJson(
     'You turn a dictated voice-note update into a task title and description, and ' +
-      'pick up on any assignment/due-date instructions in the same note. ' +
+      'pick up on any assignment/due-date/category instructions in the same note. ' +
       'The text was produced by speech-to-text from a voicemail, so expect imperfect ' +
       'transcription: misheard or phonetically-spelled names, dropped/wrong words, run-on ' +
       'sentences, and odd punctuation. Do your best to understand the intended meaning ' +
       'anyway rather than taking the literal wording too strictly. ' +
       'Reply with ONLY raw compact JSON and nothing else — no markdown, no code fences, ' +
       'no commentary before or after it: ' +
-      '{"title": "...", "description": "...", "assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null}. ' +
+      '{"title": "...", "description": "...", "assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "sectionGid": "..." or null}. ' +
       'The title is a short, specific summary (under 10 words, no trailing period). ' +
       'The description is the full context, lightly cleaned up (fix filler words/false ' +
       'starts/transcription glitches) but keeping every real detail — do not summarize the ' +
@@ -242,17 +288,30 @@ async function summarizeUpdate(text, members) {
       'If the note mentions a due date (e.g. "by Friday", "next week", "end of month"), ' +
       `resolve it to an actual date. Today is ${todayContext()}. ` +
       'If nothing is said about who it is for or when it is due, leave those fields null — ' +
-      'do not default to assigning it to anyone.',
+      'do not default to assigning it to anyone. ' +
+      'Separately, decide which section this task belongs in, using ONLY this list — never ' +
+      `invent a section gid:\n${sectionsForPrompt(categorized)}\n` +
+      'Only set sectionGid when the task clearly and confidently fits one of these categories. ' +
+      'If it could reasonably belong to more than one, is ambiguous, or does not clearly match ' +
+      'any of them, leave sectionGid null — leaving it uncategorized is always safer than a ' +
+      'wrong guess.',
     text
   );
 
   if (!parsed || !parsed.title || !parsed.description) return plainSplit(text);
+
+  // Never trust the AI's sectionGid blindly — only accept it if it's actually
+  // one of the categorizable sections we offered it.
+  const validSectionGid = categorized.some((s) => s.gid === parsed.sectionGid)
+    ? parsed.sectionGid
+    : null;
 
   return {
     title: String(parsed.title).trim(),
     description: String(parsed.description).trim(),
     assigneeGid: parsed.assigneeGid || null,
     dueDate: parsed.dueDate || null,
+    sectionGid: validSectionGid,
   };
 }
 
@@ -312,7 +371,8 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
 
   if (isDryRun) {
     const members = await getProjectMembers();
-    const preview = await summarizeUpdate(trimmed, members);
+    const sections = await getProjectSections();
+    const preview = await summarizeUpdate(trimmed, members, sections);
     const finalAssigneeGid = mergeField(assigneeGid, taskGid ? null : preview.assigneeGid);
     const finalDueDate = mergeField(dueDate, taskGid ? null : preview.dueDate);
     console.log('[DRY RUN] Would send to Asana:', {
@@ -322,6 +382,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       dueDate: finalDueDate,
       wouldUseTitle: taskGid ? null : preview.title,
       wouldUseDescription: taskGid ? null : preview.description,
+      wouldUseSectionGid: taskGid ? null : preview.sectionGid,
     });
     return res.json({ ok: true, dryRun: true, taskGid: taskGid || 'demo-new-task' });
   }
@@ -349,12 +410,20 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       payload = { data: { text: trimmed } };
     } else {
       // Create a brand-new ticket. Let Claude split this into a short title
-      // + a cleaned-up description, and pick up any assignee/due-date mention,
-      // when it's configured and within budget; otherwise plainSplit() inside
-      // summarizeUpdate() covers it seamlessly.
+      // + a cleaned-up description, pick up any assignee/due-date mention,
+      // and categorize it into a section when it's configured and within
+      // budget; otherwise plainSplit() inside summarizeUpdate() covers it
+      // seamlessly (new ticket lands with no section, which is the safe
+      // default when nothing can be inferred).
       const members = await getProjectMembers();
-      const { title, description, assigneeGid: aiAssigneeGid, dueDate: aiDueDate } =
-        await summarizeUpdate(trimmed, members);
+      const sections = await getProjectSections();
+      const {
+        title,
+        description,
+        assigneeGid: aiAssigneeGid,
+        dueDate: aiDueDate,
+        sectionGid,
+      } = await summarizeUpdate(trimmed, members, sections);
       finalAssigneeGid = mergeField(assigneeGid, aiAssigneeGid);
       finalDueDate = mergeField(dueDate, aiDueDate);
       url = `${ASANA_API}/tasks`;
@@ -362,7 +431,13 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         data: {
           name: title,
           notes: description,
-          projects: [ASANA_PROJECT_GID],
+          // With a confidently-matched section, place the task directly into
+          // it via memberships; otherwise just add it to the project with no
+          // section (lands in the default/uncategorized area), per "if
+          // unsure, don't put it in any section."
+          ...(sectionGid
+            ? { memberships: [{ project: ASANA_PROJECT_GID, section: sectionGid }] }
+            : { projects: [ASANA_PROJECT_GID] }),
           ...optionalTaskFields(finalAssigneeGid, finalDueDate),
         },
       };
