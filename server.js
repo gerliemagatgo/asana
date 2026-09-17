@@ -431,13 +431,16 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         data: {
           name: title,
           notes: description,
-          // With a confidently-matched section, place the task directly into
-          // it via memberships; otherwise just add it to the project with no
-          // section (lands in the default/uncategorized area), per "if
-          // unsure, don't put it in any section."
+          // `projects` is required on every create call (Asana needs it to
+          // infer the workspace) — `memberships` is an *additional* hint on
+          // top of that which places the task directly into a section when
+          // we have a confident match; otherwise it just lands in the
+          // project with no section (the default/uncategorized area), per
+          // "if unsure, don't put it in any section."
+          projects: [ASANA_PROJECT_GID],
           ...(sectionGid
             ? { memberships: [{ project: ASANA_PROJECT_GID, section: sectionGid }] }
-            : { projects: [ASANA_PROJECT_GID] }),
+            : {}),
           ...optionalTaskFields(finalAssigneeGid, finalDueDate),
         },
       };
