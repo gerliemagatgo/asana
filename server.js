@@ -13,10 +13,29 @@ const {
   ACCESS_CODE,
   DRY_RUN,
   PORT,
+  ANTHROPIC_API_KEY,
+  AI_DAILY_LIMIT,
 } = process.env;
 
 const ASANA_API = 'https://app.asana.com/api/1.0';
+const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001'; // cheapest current model — plenty for this
 const isDryRun = String(DRY_RUN).toLowerCase() === 'true';
+const aiDailyLimit = Number(AI_DAILY_LIMIT) > 0 ? Number(AI_DAILY_LIMIT) : 200;
+
+// Simple in-memory daily counter so a misfire can't quietly run up cost.
+// Resets whenever the calendar day changes; resets on redeploy too, which is fine.
+let aiCallDay = new Date().toDateString();
+let aiCallCount = 0;
+
+function aiBudgetAvailable() {
+  const today = new Date().toDateString();
+  if (today !== aiCallDay) {
+    aiCallDay = today;
+    aiCallCount = 0;
+  }
+  return aiCallCount < aiDailyLimit;
+}
 
 // ---- helpers -------------------------------------------------------------
 
@@ -51,6 +70,9 @@ app.get('/api/health', (req, res) => {
     dryRun: isDryRun,
     asanaConfigured: Boolean(ASANA_TOKEN && ASANA_PROJECT_GID),
     accessCodeEnabled: Boolean(ACCESS_CODE),
+    aiSummarizationConfigured: Boolean(ANTHROPIC_API_KEY),
+    aiDailyLimit,
+    aiCallsToday: aiCallCount,
   });
 });
 
@@ -117,6 +139,62 @@ app.get('/api/members', requireAccessCode, async (req, res) => {
   }
 });
 
+// Falls back to the old behavior: first ~100 chars as the title, full text
+// as the description. Used whenever AI summarization isn't available,
+// hasn't been configured, is over its daily budget, or fails for any reason.
+function plainSplit(text) {
+  const name = text.length > 100 ? `${text.slice(0, 97)}...` : text;
+  return { title: name, description: text };
+}
+
+// Asks Claude for a short title + cleaned-up description from a raw dictated
+// update. Always falls back to plainSplit() rather than ever blocking a
+// submission — a hiccup in the AI call should never stop a ticket from
+// being created.
+async function summarizeUpdate(text) {
+  if (!ANTHROPIC_API_KEY || !aiBudgetAvailable()) {
+    return plainSplit(text);
+  }
+
+  try {
+    const r = await fetch(ANTHROPIC_API, {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: ANTHROPIC_MODEL,
+        max_tokens: 200,
+        system:
+          'You turn a dictated voice-note update into a task title and description. ' +
+          'Reply with ONLY compact JSON: {"title": "...", "description": "..."}. ' +
+          'The title is a short, specific summary (under 10 words, no trailing period). ' +
+          'The description is the full context, lightly cleaned up (fix filler words/' +
+          'false starts) but keeping every real detail — do not summarize the description, ' +
+          'only the title. If the note truly has nothing beyond what fits in the title, ' +
+          'the description can repeat it.',
+        messages: [{ role: 'user', content: text }],
+      }),
+    });
+
+    if (!r.ok) return plainSplit(text); // e.g. bad key — rejected before any tokens are billed
+
+    aiCallCount += 1; // only count calls that actually reached the model (i.e. cost something)
+
+    const body = await r.json();
+    const raw = body?.content?.[0]?.text || '';
+    const parsed = JSON.parse(raw);
+    if (!parsed.title || !parsed.description) return plainSplit(text);
+
+    return { title: parsed.title.trim(), description: parsed.description.trim() };
+  } catch (err) {
+    console.error('Claude summarization failed, falling back to plain split:', err);
+    return plainSplit(text);
+  }
+}
+
 // Builds the {assignee, due_on} fields to merge into an Asana payload,
 // omitting anything the caller didn't actually set.
 function optionalTaskFields(assigneeGid, dueDate) {
@@ -138,11 +216,14 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
   }
 
   if (isDryRun) {
+    const preview = await summarizeUpdate(trimmed);
     console.log('[DRY RUN] Would send to Asana:', {
       taskGid: taskGid || null,
       text: trimmed,
       assigneeGid: assigneeGid || null,
       dueDate: dueDate || null,
+      wouldUseTitle: taskGid ? null : preview.title,
+      wouldUseDescription: taskGid ? null : preview.description,
     });
     return res.json({ ok: true, dryRun: true, taskGid: taskGid || 'demo-new-task' });
   }
@@ -154,18 +235,20 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
     let payload;
 
     if (taskGid) {
-      // Add as a comment on the chosen existing ticket.
+      // Add as a comment on the chosen existing ticket. No title needed here,
+      // so no summarization call — just the raw text as-is.
       url = `${ASANA_API}/tasks/${taskGid}/stories`;
       payload = { data: { text: trimmed } };
     } else {
-      // Create a brand-new ticket. First ~100 chars become the task name so
-      // it's scannable in list view; the full text always goes in the notes.
-      const name = trimmed.length > 100 ? `${trimmed.slice(0, 97)}...` : trimmed;
+      // Create a brand-new ticket. Let Claude split this into a short title
+      // + a cleaned-up description when it's configured and within budget;
+      // otherwise plainSplit() inside summarizeUpdate() covers it seamlessly.
+      const { title, description } = await summarizeUpdate(trimmed);
       url = `${ASANA_API}/tasks`;
       payload = {
         data: {
-          name,
-          notes: trimmed,
+          name: title,
+          notes: description,
           projects: [ASANA_PROJECT_GID],
           ...optionalTaskFields(assigneeGid, dueDate),
         },
