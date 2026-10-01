@@ -141,9 +141,11 @@ app.get('/api/members', requireAccessCode, async (req, res) => {
   }
 });
 
-// Fetches the default project's actual sections, so the AI can be told the
-// real ones instead of guessing at names.
-async function getProjectSections() {
+// Fetches a project's actual sections, so the AI can be told the real ones
+// instead of guessing at names. Defaults to the default project, but accepts
+// any project gid so it can also be used for a different board a task got
+// routed to.
+async function getProjectSections(projectGid = ASANA_PROJECT_GID) {
   if (isDryRun) {
     return [
       { gid: 'demo-section-admin', name: 'Admin' },
@@ -151,13 +153,59 @@ async function getProjectSections() {
       { gid: 'demo-section-recurring', name: 'Recurring Appointments' },
     ];
   }
-  if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return [];
+  if (!ASANA_TOKEN || !projectGid) return [];
 
-  const url = `${ASANA_API}/projects/${ASANA_PROJECT_GID}/sections?opt_fields=name,gid`;
+  const url = `${ASANA_API}/projects/${projectGid}/sections?opt_fields=name,gid`;
   const r = await fetch(url, { headers: asanaHeaders() });
   if (!r.ok) return [];
   const body = await r.json();
   return (body.data || []).map((s) => ({ gid: s.gid, name: s.name }));
+}
+
+// Which workspace the default project lives in, so we can list every board
+// in it. Fetched once and cached for the life of the process — a project's
+// workspace never changes, so there's no reason to ask Asana again.
+let cachedWorkspaceGid = null;
+async function getWorkspaceGid() {
+  if (isDryRun) return 'demo-workspace';
+  if (cachedWorkspaceGid) return cachedWorkspaceGid;
+  if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return null;
+
+  const url = `${ASANA_API}/projects/${ASANA_PROJECT_GID}?opt_fields=workspace.gid`;
+  const r = await fetch(url, { headers: asanaHeaders() });
+  if (!r.ok) return null;
+  const body = await r.json();
+  cachedWorkspaceGid = body.data?.workspace?.gid || null;
+  return cachedWorkspaceGid;
+}
+
+// All boards/projects in the workspace, so a new ticket can be routed to
+// whichever one it actually belongs on instead of always landing in the
+// single default project. Cached briefly — this almost never changes and
+// re-fetching it on every single dictated update would just be wasted calls.
+let cachedProjects = null;
+let cachedProjectsAt = 0;
+const PROJECTS_CACHE_MS = 10 * 60 * 1000; // 10 minutes
+async function getWorkspaceProjects() {
+  if (isDryRun) {
+    return [
+      { gid: ASANA_PROJECT_GID || 'demo-project', name: '(dry run) Default project' },
+      { gid: 'demo-project-2', name: '(dry run) Other board' },
+    ];
+  }
+  const now = Date.now();
+  if (cachedProjects && now - cachedProjectsAt < PROJECTS_CACHE_MS) return cachedProjects;
+
+  const workspaceGid = await getWorkspaceGid();
+  if (!workspaceGid) return cachedProjects || [];
+
+  const url = `${ASANA_API}/workspaces/${workspaceGid}/projects?opt_fields=name&archived=false&limit=100`;
+  const r = await fetch(url, { headers: asanaHeaders() });
+  if (!r.ok) return cachedProjects || [];
+  const body = await r.json();
+  cachedProjects = (body.data || []).map((p) => ({ gid: p.gid, name: p.name }));
+  cachedProjectsAt = now;
+  return cachedProjects;
 }
 
 // Only auto-categorize into these three specific buckets, matched by keyword
@@ -185,13 +233,43 @@ function sectionsForPrompt(categorized) {
   return categorized.map((s) => `"${s.name}" — use for ${s.category} (gid: ${s.gid})`).join('\n');
 }
 
+// Formats the workspace's boards into "Name (gid: 123)" lines so Claude can
+// pick the right one by name, rather than us guessing from keywords.
+function projectsForPrompt(projects) {
+  if (!projects.length) return '(no other boards available — leave projectGid null)';
+  return projects.map((p) => `${p.name} (gid: ${p.gid})`).join('\n');
+}
+
+// Turns the AI's coarse category guess ("admin" / "adhoc" / "recurring")
+// into an actual section gid on the project the task is landing in — using
+// the same safe, never-invent-a-gid keyword matching as before, just scoped
+// to whichever board got picked rather than always the default one.
+function sectionGidForCategory(category, sections) {
+  if (!category || category === 'other') return null;
+  const categorized = categorizableSections(sections);
+  const match = categorized.find((s) =>
+    category === 'admin' ? s.category.startsWith('admin') :
+    category === 'adhoc' ? s.category.startsWith('random') :
+    category === 'recurring' ? s.category.startsWith('any kind of recurring') :
+    false
+  );
+  return match ? match.gid : null;
+}
+
 // Falls back to the old behavior: first ~100 chars as the title, full text
-// as the description, no assignee/due date/section guessed. Used whenever AI
-// summarization isn't available, hasn't been configured, is over its daily
-// budget, or fails for any reason.
+// as the description, no assignee/due date/project/section guessed. Used
+// whenever AI summarization isn't available, hasn't been configured, is over
+// its daily budget, or fails for any reason.
 function plainSplit(text) {
   const name = text.length > 100 ? `${text.slice(0, 97)}...` : text;
-  return { title: name, description: text, assigneeGid: null, dueDate: null, sectionGid: null };
+  return {
+    title: name,
+    description: text,
+    assigneeGid: null,
+    dueDate: null,
+    projectGid: null,
+    sectionGid: null,
+  };
 }
 
 // Formats the member list into "Name (gid: 123)" lines so Claude can match a
@@ -263,21 +341,23 @@ async function callClaudeJson(system, userText) {
 }
 
 // Asks Claude for a short title + cleaned-up description from a raw dictated
-// update, and — since the same note often says who it's for or when it's
-// due, or clearly reads as one of a few known task categories — also pulls
-// out an assignee, due date, and section if they apply.
-async function summarizeUpdate(text, members, sections) {
-  const categorized = categorizableSections(sections);
+// update, and — since the same note often says who it's for, when it's due,
+// which board it belongs on, or clearly reads as one of a few known task
+// categories — also pulls out an assignee, due date, board, and category in
+// the same single call (so this costs no more than it always did). The
+// board's actual section gid is resolved afterwards, separately, once we
+// know which board was chosen — see sectionGidForCategory().
+async function summarizeUpdate(text, members, projects, defaultProjectGid) {
   const parsed = await callClaudeJson(
     'You turn a dictated voice-note update into a task title and description, and ' +
-      'pick up on any assignment/due-date/category instructions in the same note. ' +
+      'pick up on any assignment/due-date/board/category instructions in the same note. ' +
       'The text was produced by speech-to-text from a voicemail, so expect imperfect ' +
       'transcription: misheard or phonetically-spelled names, dropped/wrong words, run-on ' +
       'sentences, and odd punctuation. Do your best to understand the intended meaning ' +
       'anyway rather than taking the literal wording too strictly. ' +
       'Reply with ONLY raw compact JSON and nothing else — no markdown, no code fences, ' +
       'no commentary before or after it: ' +
-      '{"title": "...", "description": "...", "assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "sectionGid": "..." or null}. ' +
+      '{"title": "...", "description": "...", "assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "projectGid": "..." or null, "category": "admin" or "adhoc" or "recurring" or "other"}. ' +
       'The title is a short, specific summary (under 10 words, no trailing period). ' +
       'The description is the full context, lightly cleaned up (fix filler words/false ' +
       'starts/transcription glitches) but keeping every real detail — do not summarize the ' +
@@ -289,21 +369,29 @@ async function summarizeUpdate(text, members, sections) {
       `resolve it to an actual date. Today is ${todayContext()}. ` +
       'If nothing is said about who it is for or when it is due, leave those fields null — ' +
       'do not default to assigning it to anyone. ' +
-      'Separately, decide which section this task belongs in, using ONLY this list — never ' +
-      `invent a section gid:\n${sectionsForPrompt(categorized)}\n` +
-      'Only set sectionGid when the task clearly and confidently fits one of these categories. ' +
-      'If it could reasonably belong to more than one, is ambiguous, or does not clearly match ' +
-      'any of them, leave sectionGid null — leaving it uncategorized is always safer than a ' +
-      'wrong guess.',
+      'Separately, decide which board/project this task actually belongs on, using ONLY ' +
+      `this list — never invent a gid:\n${projectsForPrompt(projects)}\n` +
+      `The default board is (gid: ${defaultProjectGid || 'none configured'}) — only set ` +
+      'projectGid to a DIFFERENT board when the task clearly and specifically belongs there ' +
+      'instead (e.g. it is obviously about a different person, property, or area of the ' +
+      'business than the default board covers). If it could reasonably stay on the default ' +
+      'board, is ambiguous, or you are not confident, leave projectGid null — landing on the ' +
+      'default board is always safer than routing it to the wrong one. ' +
+      'Also classify the task into one of these categories, so it can be dropped into the ' +
+      'right section once a board is chosen: "admin" for paperwork/scheduling/business admin ' +
+      'work, "adhoc" for a random one-off/miscellaneous task, "recurring" for any kind of ' +
+      'recurring personal appointment (medical, grooming, subscriptions, etc.), or "other" if ' +
+      'it genuinely does not fit any of those — when unsure, use "other" rather than guessing.',
     text
   );
 
   if (!parsed || !parsed.title || !parsed.description) return plainSplit(text);
 
-  // Never trust the AI's sectionGid blindly — only accept it if it's actually
-  // one of the categorizable sections we offered it.
-  const validSectionGid = categorized.some((s) => s.gid === parsed.sectionGid)
-    ? parsed.sectionGid
+  // Never trust the AI's projectGid blindly — only accept it if it's
+  // actually one of the boards we offered it; otherwise stick with the
+  // default board.
+  const validProjectGid = projects.some((p) => p.gid === parsed.projectGid)
+    ? parsed.projectGid
     : null;
 
   return {
@@ -311,7 +399,8 @@ async function summarizeUpdate(text, members, sections) {
     description: String(parsed.description).trim(),
     assigneeGid: parsed.assigneeGid || null,
     dueDate: parsed.dueDate || null,
-    sectionGid: validSectionGid,
+    projectGid: validProjectGid,
+    category: parsed.category || null,
   };
 }
 
@@ -373,6 +462,13 @@ function mergeField(explicitValue, aiValue) {
   return explicitValue || aiValue || null;
 }
 
+// A direct link to the task, so the app can show "Open in Asana" right after
+// sending instead of making someone go hunt for what just got created.
+function taskUrl(projectGid, taskGid) {
+  if (!taskGid) return null;
+  return `https://app.asana.com/0/${projectGid || '0'}/${taskGid}`;
+}
+
 // Either update an existing task (taskGid provided) or create a new one in
 // the default project (taskGid omitted). assigneeGid and dueDate are both
 // optional in either case, and can come from the UI, from AI reading the
@@ -398,18 +494,24 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         shouldComment: assessed.shouldComment,
       });
     } else {
-      const sections = await getProjectSections();
-      const preview = await summarizeUpdate(trimmed, members, sections);
+      const projects = await getWorkspaceProjects();
+      const preview = await summarizeUpdate(trimmed, members, projects, ASANA_PROJECT_GID);
       console.log('[DRY RUN] Would create new ticket:', {
         text: trimmed,
         assigneeGid: mergeField(assigneeGid, preview.assigneeGid),
         dueDate: mergeField(dueDate, preview.dueDate),
         wouldUseTitle: preview.title,
         wouldUseDescription: preview.description,
-        wouldUseSectionGid: preview.sectionGid,
+        wouldUseProjectGid: preview.projectGid || ASANA_PROJECT_GID,
+        wouldUseCategory: preview.category,
       });
     }
-    return res.json({ ok: true, dryRun: true, taskGid: taskGid || 'demo-new-task' });
+    return res.json({
+      ok: true,
+      dryRun: true,
+      taskGid: taskGid || 'demo-new-task',
+      taskUrl: taskUrl(ASANA_PROJECT_GID, taskGid || 'demo-new-task'),
+    });
   }
 
   if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return serverMisconfigured(res);
@@ -469,26 +571,36 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         }
       }
 
-      return res.json({ ok: true, taskGid, warning, actions });
+      return res.json({ ok: true, taskGid, warning, actions, taskUrl: taskUrl(ASANA_PROJECT_GID, taskGid) });
     }
 
     // Create a brand-new ticket. Let Claude split this into a short title +
-    // a cleaned-up description, pick up any assignee/due-date mention, and
-    // categorize it into a section when it's configured and within budget;
-    // otherwise plainSplit() inside summarizeUpdate() covers it seamlessly
-    // (new ticket lands with no section, which is the safe default when
-    // nothing can be inferred).
+    // a cleaned-up description, pick up any assignee/due-date mention, route
+    // it to the right board when it clearly belongs somewhere other than the
+    // default, and classify it into a category; otherwise plainSplit() inside
+    // summarizeUpdate() covers it seamlessly (new ticket lands on the default
+    // board with no section, which is the safe fallback when nothing can be
+    // inferred).
     const members = await getProjectMembers();
-    const sections = await getProjectSections();
+    const projects = await getWorkspaceProjects();
     const {
       title,
       description,
       assigneeGid: aiAssigneeGid,
       dueDate: aiDueDate,
-      sectionGid,
-    } = await summarizeUpdate(trimmed, members, sections);
+      projectGid: aiProjectGid,
+      category,
+    } = await summarizeUpdate(trimmed, members, projects, ASANA_PROJECT_GID);
     const finalAssigneeGid = mergeField(assigneeGid, aiAssigneeGid);
     const finalDueDate = mergeField(dueDate, aiDueDate);
+    const finalProjectGid = aiProjectGid || ASANA_PROJECT_GID;
+
+    // Only now, once we know which board it's landing on, look up that
+    // board's actual sections and translate the category into a real gid —
+    // never inventing one, and leaving it uncategorized if that board
+    // doesn't have a matching section.
+    const sections = await getProjectSections(finalProjectGid);
+    const sectionGid = sectionGidForCategory(category, sections);
 
     const payload = {
       data: {
@@ -500,9 +612,9 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         // we have a confident match; otherwise it just lands in the
         // project with no section (the default/uncategorized area), per
         // "if unsure, don't put it in any section."
-        projects: [ASANA_PROJECT_GID],
+        projects: [finalProjectGid],
         ...(sectionGid
-          ? { memberships: [{ project: ASANA_PROJECT_GID, section: sectionGid }] }
+          ? { memberships: [{ project: finalProjectGid, section: sectionGid }] }
           : {}),
         ...optionalTaskFields(finalAssigneeGid, finalDueDate),
       },
@@ -520,7 +632,14 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       return res.status(r.status).json({ error: message });
     }
 
-    res.json({ ok: true, taskGid: body?.data?.gid || null, warning: null, actions: ['created'] });
+    const newTaskGid = body?.data?.gid || null;
+    res.json({
+      ok: true,
+      taskGid: newTaskGid,
+      warning: null,
+      actions: ['created'],
+      taskUrl: taskUrl(finalProjectGid, newTaskGid),
+    });
   } catch (err) {
     console.error('POST /api/submit failed:', err);
     res.status(502).json({ error: 'Could not reach Asana. Try again in a moment.' });

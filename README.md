@@ -100,9 +100,29 @@ variable (or set it to `false`) once you've confirmed it looks right.
 
 ## Extending this later
 
-- **Route to different projects:** the server only knows about one project
-  right now. If tickets need to land in different places, that's a small
-  change to `/api/submit` (e.g. a second dropdown for project).
 - **Voice-triggered instead of tap-to-open:** an iPhone Shortcut can open
   this app's URL (or POST straight to `/api/submit`) from a Siri phrase like
   "Hey Siri, log update" — fully hands-free, no unlocking the phone first.
+
+## Automatic board + section routing, and the Asana link
+
+`ASANA_PROJECT_GID` is still the *default* board new tickets land on, but a
+new ticket is no longer stuck there — the same AI pass that writes the
+title/description also looks at every other board in your workspace and
+moves the ticket to a different one only when it's clearly and specifically
+about something else (e.g. the default board is personal/household and the
+note is obviously a business-dev item). When it's at all ambiguous, it stays
+on the default board — that's always the safer call.
+
+Once a board is picked, the ticket is also dropped into that board's
+"Admin" / "Ad Hoc" / "Recurring" section automatically, the same way it
+always categorized sections on the one default project — just scoped to
+whichever board it actually landed on.
+
+After every send, the app now also shows an **Open in Asana** link straight
+to the ticket that was just created or updated, so you're never stuck
+hunting for it.
+
+None of this needs a new environment variable — it reuses the same
+`ASANA_TOKEN` and `ASANA_PROJECT_GID` you already set, and simply asks Asana
+which other boards that token can see.
