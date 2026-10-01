@@ -145,6 +145,11 @@
   }
   .status.ok { color: var(--ok); }
   .status.err { color: var(--err); }
+  .status a {
+    color: inherit;
+    font-weight: 600;
+    text-decoration: underline;
+  }
   .footer-link {
     text-align: center;
     margin-top: 6px;
@@ -359,9 +364,12 @@
       });
       const body = await r.json();
       if (!r.ok) throw new Error(body.error || 'Something went wrong.');
-      statusEl.textContent = body.warning
+      const summary = body.warning
         ? `${describeActions(body.actions)} — ${body.warning}`
         : `${describeActions(body.actions)} ✓`;
+      statusEl.innerHTML = body.taskUrl
+        ? `${summary} — <a href="${body.taskUrl}" target="_blank" rel="noopener">Open in Asana</a>`
+        : summary;
       statusEl.className = body.warning ? 'status err' : 'status ok';
       textEl.value = '';
     } catch (err) {
