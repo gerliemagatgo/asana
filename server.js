@@ -381,19 +381,19 @@ async function summarizeUpdate(text, members, projects, defaultProjectGid) {
       'commentary before or after it: {"tasks": [{"title": "...", "description": "...", ' +
       '"assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "projectGid": "..." or ' +
       'null, "category": "admin" or "adhoc" or "recurring" or "other", "subtasks": ["...", ...]}, ...]}. ' +
-      'First decide how many tickets this note actually describes: ' +
-      'if it names two or more genuinely separate, independent things to do — unrelated ' +
-      'errands, different people/topics, things that would still make sense to finish on ' +
-      'totally different days with no bearing on each other — give each its own entry in ' +
-      '"tasks". But if the note describes ONE goal or thread made up of smaller steps, ' +
-      'check-ins, or milestones along the way (e.g. first get a quote, then book it, then ' +
-      'confirm it — all in service of the same outcome), that is a SINGLE task entry with ' +
-      'those steps listed in "subtasks" instead of being split into separate tasks. When ' +
-      'genuinely unsure whether something is a separate task or a step of another one, prefer ' +
-      'treating it as a single task with subtasks — under-splitting is easier to fix by hand ' +
-      'than untangling tickets that got wrongly merged. Most notes describe exactly one task ' +
-      'with an empty subtasks list; only split or add subtasks when the note clearly calls ' +
-      'for it. ' +
+      'First decide how many tickets this note actually describes, using one test: are these ' +
+      'things part of the SAME matter, or do they concern a genuinely DIFFERENT matter? Steps, ' +
+      'check-ins, sub-parts, or follow-ups that all belong to one underlying matter, person, or ' +
+      'goal — even if there are several of them — stay together as ONE task, with each of ' +
+      'those parts listed in "subtasks" instead (e.g. for a sauna project, "get quotes from ' +
+      'contractors", "pick a contractor", and "schedule the install" are all the same matter, ' +
+      'so that\'s one task with three subtasks). Only give something its own separate entry in ' +
+      '"tasks" when it is clearly about a DIFFERENT matter — a different person, issue, or ' +
+      'topic that has no real bearing on the other one. When genuinely unsure whether two ' +
+      'things are the same matter or different ones, treat them as the same matter (one task ' +
+      'with subtasks) — under-splitting is easier to fix by hand than untangling tickets that ' +
+      'got wrongly merged. Most notes describe exactly one task with an empty subtasks list; ' +
+      'only add subtasks or a second task when the note clearly calls for it. ' +
       'For each task: the title is a short, specific summary (under 10 words, no trailing ' +
       'period). The description is that task\'s full context, lightly cleaned up (fix filler ' +
       'words/false starts/transcription glitches) but keeping every real detail — do not ' +

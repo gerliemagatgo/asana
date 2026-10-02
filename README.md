@@ -124,20 +124,21 @@ whichever board it actually landed on.
 One dictated note doesn't always mean one ticket. The same AI pass now also
 decides:
 
-- **Separate tickets** when the note names two or more genuinely independent
-  things — unrelated errands, different people or topics, anything that
-  would make sense to finish on completely different days. Each one lands as
-  its own ticket (own title, description, assignee, due date, board, and
-  section).
-- **Subtasks on one ticket** when the note describes a single goal made up of
-  smaller steps or milestones (e.g. "get quotes, then pick a contractor,
-  then schedule the install") — those become Asana subtasks under one
-  ticket instead of separate tickets.
+The test it uses is **same matter vs. different matter**:
 
-Most notes are still just one plain ticket with no subtasks — splitting or
-adding subtasks only happens when the note clearly calls for it; when it's
-a toss-up, it stays as a single ticket (easier to split by hand later than
-to untangle wrongly-separated tickets). If a ticket's subtasks fail to save
+- **Same matter → subtasks on one ticket.** Steps, check-ins, or sub-parts
+  that all belong to the same underlying thing — even several of them —
+  stay together as one ticket (e.g. "get quotes, then pick a contractor,
+  then schedule the install" for one sauna project is one ticket with three
+  subtasks).
+- **Different matter → its own separate ticket.** Only when something is
+  about a genuinely different person, issue, or topic with no real bearing
+  on the other one does it get split into a second ticket, with its own
+  title, description, assignee, due date, board, and section.
+
+When it's a toss-up, it stays as one ticket (easier to split by hand later
+than to untangle wrongly-separated tickets) — most notes still end up as
+just one plain ticket with no subtasks. If a ticket's subtasks fail to save
 for some reason, the ticket itself still gets created — you'll see a note
 in the app telling you which subtask to add by hand.
 
