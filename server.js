@@ -21,9 +21,10 @@ const ASANA_API = 'https://app.asana.com/api/1.0';
 const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001'; // cheapest current model — plenty for this
 const isDryRun = String(DRY_RUN).toLowerCase() === 'true';
-// Default of 80/day is sized to keep worst-case Claude Haiku spend under
-// ~$5/month even if every call maxes out its ~750 input + 250 output tokens
-// (80 calls/day * 30 days * ~$0.002/call ≈ $4.80). Override with a lower
+// Default of 80/day is sized to keep worst-case Claude Haiku spend well
+// under $5/month even on the priciest call (new-ticket splitting, which can
+// use up to ~750 input + 900 output tokens if a note turns into several
+// tasks with subtasks — most calls use far less). Override with a lower
 // AI_DAILY_LIMIT env var for an even tighter cap.
 const aiDailyLimit = Number(AI_DAILY_LIMIT) > 0 ? Number(AI_DAILY_LIMIT) : 80;
 
@@ -256,20 +257,37 @@ function sectionGidForCategory(category, sections) {
   return match ? match.gid : null;
 }
 
-// Falls back to the old behavior: first ~100 chars as the title, full text
-// as the description, no assignee/due date/project/section guessed. Used
-// whenever AI summarization isn't available, hasn't been configured, is over
-// its daily budget, or fails for any reason.
+// Falls back to the old behavior: one ticket, first ~100 chars as the title,
+// full text as the description, no assignee/due date/project/subtasks
+// guessed. Used whenever AI summarization isn't available, hasn't been
+// configured, is over its daily budget, or fails for any reason.
 function plainSplit(text) {
   const name = text.length > 100 ? `${text.slice(0, 97)}...` : text;
   return {
-    title: name,
-    description: text,
-    assigneeGid: null,
-    dueDate: null,
-    projectGid: null,
-    sectionGid: null,
+    tasks: [
+      {
+        title: name,
+        description: text,
+        assigneeGid: null,
+        dueDate: null,
+        projectGid: null,
+        category: null,
+        subtasks: [],
+      },
+    ],
   };
+}
+
+// Keeps a task's subtask list sane no matter what the AI returns — strings
+// only, trimmed, never empty, and capped so one dictated note can't somehow
+// blow up into dozens of Asana API calls.
+const MAX_SUBTASKS_PER_TASK = 10;
+function sanitizeSubtasks(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((s) => String(s || '').trim())
+    .filter(Boolean)
+    .slice(0, MAX_SUBTASKS_PER_TASK);
 }
 
 // Formats the member list into "Name (gid: 123)" lines so Claude can match a
@@ -306,9 +324,12 @@ function parseJsonLoose(raw) {
 }
 
 // Calls Claude once and returns parsed JSON, or null on any failure. Shared
-// by summarizeUpdate() and extractAssigneeAndDueDate() below — both always
-// fall back to non-AI behavior on null rather than ever blocking a submission.
-async function callClaudeJson(system, userText) {
+// by summarizeUpdate() and assessExistingTicketUpdate() below — both always
+// fall back to non-AI behavior on null rather than ever blocking a
+// submission. maxTokens defaults to the small single-object replies, but
+// summarizeUpdate() asks for more room since it can return several tasks,
+// each with its own description and subtask list.
+async function callClaudeJson(system, userText, maxTokens = 250) {
   if (!ANTHROPIC_API_KEY || !aiBudgetAvailable()) return null;
 
   try {
@@ -321,7 +342,7 @@ async function callClaudeJson(system, userText) {
       },
       body: JSON.stringify({
         model: ANTHROPIC_MODEL,
-        max_tokens: 250,
+        max_tokens: maxTokens,
         system,
         messages: [{ role: 'user', content: userText }],
       }),
@@ -340,68 +361,90 @@ async function callClaudeJson(system, userText) {
   }
 }
 
-// Asks Claude for a short title + cleaned-up description from a raw dictated
-// update, and — since the same note often says who it's for, when it's due,
-// which board it belongs on, or clearly reads as one of a few known task
-// categories — also pulls out an assignee, due date, board, and category in
-// the same single call (so this costs no more than it always did). The
-// board's actual section gid is resolved afterwards, separately, once we
-// know which board was chosen — see sectionGidForCategory().
+// Asks Claude to turn a raw dictated update into one or more tickets. A note
+// often describes several genuinely separate things to do (those become
+// separate tickets) or one goal with a few concrete steps/milestones along
+// the way (those become one ticket with subtasks) — Claude decides which,
+// per the splitting rule in the prompt below. For each ticket it also pulls
+// out an assignee, due date, board, and category in the same single call
+// (so this costs no more than a one-ticket note always did). Each board's
+// actual section gid is resolved afterwards, separately, once we know which
+// board was chosen — see sectionGidForCategory().
 async function summarizeUpdate(text, members, projects, defaultProjectGid) {
   const parsed = await callClaudeJson(
-    'You turn a dictated voice-note update into a task title and description, and ' +
-      'pick up on any assignment/due-date/board/category instructions in the same note. ' +
-      'The text was produced by speech-to-text from a voicemail, so expect imperfect ' +
-      'transcription: misheard or phonetically-spelled names, dropped/wrong words, run-on ' +
-      'sentences, and odd punctuation. Do your best to understand the intended meaning ' +
-      'anyway rather than taking the literal wording too strictly. ' +
-      'Reply with ONLY raw compact JSON and nothing else — no markdown, no code fences, ' +
-      'no commentary before or after it: ' +
-      '{"title": "...", "description": "...", "assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "projectGid": "..." or null, "category": "admin" or "adhoc" or "recurring" or "other"}. ' +
-      'The title is a short, specific summary (under 10 words, no trailing period). ' +
-      'The description is the full context, lightly cleaned up (fix filler words/false ' +
-      'starts/transcription glitches) but keeping every real detail — do not summarize the ' +
-      'description, only the title. If the note names who this should be assigned to, match ' +
-      'them against this exact member list and return their gid — match by sound-alike/' +
-      'phonetic similarity too (e.g. "Katy", "Cady", "Katie" should all match a member named ' +
-      `"Katie"), but never invent a gid and never guess if genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
-      'If the note mentions a due date (e.g. "by Friday", "next week", "end of month"), ' +
-      `resolve it to an actual date. Today is ${todayContext()}. ` +
-      'If nothing is said about who it is for or when it is due, leave those fields null — ' +
+    'You turn a dictated voice-note update into one or more Asana tickets. The text was ' +
+      'produced by speech-to-text from a voicemail, so expect imperfect transcription: ' +
+      'misheard or phonetically-spelled names, dropped/wrong words, run-on sentences, and odd ' +
+      'punctuation. Do your best to understand the intended meaning anyway rather than taking ' +
+      'the literal wording too strictly. ' +
+      'Reply with ONLY raw compact JSON and nothing else — no markdown, no code fences, no ' +
+      'commentary before or after it: {"tasks": [{"title": "...", "description": "...", ' +
+      '"assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "projectGid": "..." or ' +
+      'null, "category": "admin" or "adhoc" or "recurring" or "other", "subtasks": ["...", ...]}, ...]}. ' +
+      'First decide how many tickets this note actually describes: ' +
+      'if it names two or more genuinely separate, independent things to do — unrelated ' +
+      'errands, different people/topics, things that would still make sense to finish on ' +
+      'totally different days with no bearing on each other — give each its own entry in ' +
+      '"tasks". But if the note describes ONE goal or thread made up of smaller steps, ' +
+      'check-ins, or milestones along the way (e.g. first get a quote, then book it, then ' +
+      'confirm it — all in service of the same outcome), that is a SINGLE task entry with ' +
+      'those steps listed in "subtasks" instead of being split into separate tasks. When ' +
+      'genuinely unsure whether something is a separate task or a step of another one, prefer ' +
+      'treating it as a single task with subtasks — under-splitting is easier to fix by hand ' +
+      'than untangling tickets that got wrongly merged. Most notes describe exactly one task ' +
+      'with an empty subtasks list; only split or add subtasks when the note clearly calls ' +
+      'for it. ' +
+      'For each task: the title is a short, specific summary (under 10 words, no trailing ' +
+      'period). The description is that task\'s full context, lightly cleaned up (fix filler ' +
+      'words/false starts/transcription glitches) but keeping every real detail — do not ' +
+      'summarize the description, only the title. subtasks are short imperative phrases for ' +
+      `each milestone/step (e.g. "Get quotes from contractors"), in the order they'd happen — ` +
+      'leave it an empty array when the task has no distinct sub-steps worth tracking ' +
+      'separately (most of the time). ' +
+      'If the note names who a given task should be assigned to, match them against this ' +
+      'exact member list and return their gid — match by sound-alike/phonetic similarity too ' +
+      '(e.g. "Katy", "Cady", "Katie" should all match a member named "Katie"), but never ' +
+      `invent a gid and never guess if genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
+      'If a task mentions a due date (e.g. "by Friday", "next week", "end of month"), resolve ' +
+      `it to an actual date. Today is ${todayContext()}. ` +
+      'If nothing is said about who a task is for or when it is due, leave those fields null — ' +
       'do not default to assigning it to anyone. ' +
-      'Separately, decide which board/project this task actually belongs on, using ONLY ' +
-      `this list — never invent a gid:\n${projectsForPrompt(projects)}\n` +
+      'Separately, decide which board/project each task actually belongs on, using ONLY this ' +
+      `list — never invent a gid:\n${projectsForPrompt(projects)}\n` +
       `The default board is (gid: ${defaultProjectGid || 'none configured'}) — only set ` +
-      'projectGid to a DIFFERENT board when the task clearly and specifically belongs there ' +
+      'projectGid to a DIFFERENT board when a task clearly and specifically belongs there ' +
       'instead (e.g. it is obviously about a different person, property, or area of the ' +
       'business than the default board covers). If it could reasonably stay on the default ' +
       'board, is ambiguous, or you are not confident, leave projectGid null — landing on the ' +
       'default board is always safer than routing it to the wrong one. ' +
-      'Also classify the task into one of these categories, so it can be dropped into the ' +
+      'Also classify each task into one of these categories, so it can be dropped into the ' +
       'right section once a board is chosen: "admin" for paperwork/scheduling/business admin ' +
       'work, "adhoc" for a random one-off/miscellaneous task, "recurring" for any kind of ' +
       'recurring personal appointment (medical, grooming, subscriptions, etc.), or "other" if ' +
       'it genuinely does not fit any of those — when unsure, use "other" rather than guessing.',
-    text
+    text,
+    900 // a few tasks' worth of descriptions + subtasks can run well past the default budget
   );
 
-  if (!parsed || !parsed.title || !parsed.description) return plainSplit(text);
+  const rawTasks = Array.isArray(parsed?.tasks) ? parsed.tasks : null;
+  if (!rawTasks || !rawTasks.length) return plainSplit(text);
 
-  // Never trust the AI's projectGid blindly — only accept it if it's
-  // actually one of the boards we offered it; otherwise stick with the
-  // default board.
-  const validProjectGid = projects.some((p) => p.gid === parsed.projectGid)
-    ? parsed.projectGid
-    : null;
+  const tasks = rawTasks
+    .filter((t) => t && t.title && t.description)
+    .map((t) => ({
+      title: String(t.title).trim(),
+      description: String(t.description).trim(),
+      assigneeGid: t.assigneeGid || null,
+      dueDate: t.dueDate || null,
+      // Never trust the AI's projectGid blindly — only accept it if it's
+      // actually one of the boards we offered it; otherwise stick with the
+      // default board.
+      projectGid: projects.some((p) => p.gid === t.projectGid) ? t.projectGid : null,
+      category: t.category || null,
+      subtasks: sanitizeSubtasks(t.subtasks),
+    }));
 
-  return {
-    title: String(parsed.title).trim(),
-    description: String(parsed.description).trim(),
-    assigneeGid: parsed.assigneeGid || null,
-    dueDate: parsed.dueDate || null,
-    projectGid: validProjectGid,
-    category: parsed.category || null,
-  };
+  return tasks.length ? { tasks } : plainSplit(text);
 }
 
 // Used when a dictated note is being added to an EXISTING ticket. Rather than
@@ -495,15 +538,18 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       });
     } else {
       const projects = await getWorkspaceProjects();
-      const preview = await summarizeUpdate(trimmed, members, projects, ASANA_PROJECT_GID);
-      console.log('[DRY RUN] Would create new ticket:', {
+      const { tasks: preview } = await summarizeUpdate(trimmed, members, projects, ASANA_PROJECT_GID);
+      console.log('[DRY RUN] Would create', preview.length, 'ticket(s):', {
         text: trimmed,
-        assigneeGid: mergeField(assigneeGid, preview.assigneeGid),
-        dueDate: mergeField(dueDate, preview.dueDate),
-        wouldUseTitle: preview.title,
-        wouldUseDescription: preview.description,
-        wouldUseProjectGid: preview.projectGid || ASANA_PROJECT_GID,
-        wouldUseCategory: preview.category,
+        tasks: preview.map((t) => ({
+          assigneeGid: mergeField(assigneeGid, t.assigneeGid),
+          dueDate: mergeField(dueDate, t.dueDate),
+          wouldUseTitle: t.title,
+          wouldUseDescription: t.description,
+          wouldUseProjectGid: t.projectGid || ASANA_PROJECT_GID,
+          wouldUseCategory: t.category,
+          wouldUseSubtasks: t.subtasks,
+        })),
       });
     }
     return res.json({
@@ -511,6 +557,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       dryRun: true,
       taskGid: taskGid || 'demo-new-task',
       taskUrl: taskUrl(ASANA_PROJECT_GID, taskGid || 'demo-new-task'),
+      tasks: taskGid ? undefined : [{ title: trimmed, taskGid: 'demo-new-task', taskUrl: taskUrl(ASANA_PROJECT_GID, 'demo-new-task'), subtaskCount: 0 }],
     });
   }
 
@@ -571,74 +618,118 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         }
       }
 
-      return res.json({ ok: true, taskGid, warning, actions, taskUrl: taskUrl(ASANA_PROJECT_GID, taskGid) });
+      return res.json({
+        ok: true,
+        taskGid,
+        warning,
+        actions,
+        taskUrl: taskUrl(ASANA_PROJECT_GID, taskGid),
+        tasks: [{ title: null, taskGid, taskUrl: taskUrl(ASANA_PROJECT_GID, taskGid), subtaskCount: 0 }],
+      });
     }
 
-    // Create a brand-new ticket. Let Claude split this into a short title +
-    // a cleaned-up description, pick up any assignee/due-date mention, route
-    // it to the right board when it clearly belongs somewhere other than the
-    // default, and classify it into a category; otherwise plainSplit() inside
-    // summarizeUpdate() covers it seamlessly (new ticket lands on the default
-    // board with no section, which is the safe fallback when nothing can be
-    // inferred).
+    // Create one or more brand-new tickets. Let Claude split the note into
+    // separate tickets vs. one ticket with subtasks (see summarizeUpdate),
+    // pick up any assignee/due-date mention per ticket, route each to the
+    // right board when it clearly belongs somewhere other than the default,
+    // and classify it into a category; otherwise plainSplit() inside
+    // summarizeUpdate() covers it seamlessly (a single ticket lands on the
+    // default board with no section/subtasks, the safe fallback when
+    // nothing can be inferred).
     const members = await getProjectMembers();
     const projects = await getWorkspaceProjects();
-    const {
-      title,
-      description,
-      assigneeGid: aiAssigneeGid,
-      dueDate: aiDueDate,
-      projectGid: aiProjectGid,
-      category,
-    } = await summarizeUpdate(trimmed, members, projects, ASANA_PROJECT_GID);
-    const finalAssigneeGid = mergeField(assigneeGid, aiAssigneeGid);
-    const finalDueDate = mergeField(dueDate, aiDueDate);
-    const finalProjectGid = aiProjectGid || ASANA_PROJECT_GID;
+    const { tasks: plannedTasks } = await summarizeUpdate(trimmed, members, projects, ASANA_PROJECT_GID);
 
-    // Only now, once we know which board it's landing on, look up that
-    // board's actual sections and translate the category into a real gid —
-    // never inventing one, and leaving it uncategorized if that board
-    // doesn't have a matching section.
-    const sections = await getProjectSections(finalProjectGid);
-    const sectionGid = sectionGidForCategory(category, sections);
+    const created = [];
+    let warning = null;
 
-    const payload = {
-      data: {
-        name: title,
-        notes: description,
-        // `projects` is required on every create call (Asana needs it to
-        // infer the workspace) — `memberships` is an *additional* hint on
-        // top of that which places the task directly into a section when
-        // we have a confident match; otherwise it just lands in the
-        // project with no section (the default/uncategorized area), per
-        // "if unsure, don't put it in any section."
-        projects: [finalProjectGid],
-        ...(sectionGid
-          ? { memberships: [{ project: finalProjectGid, section: sectionGid }] }
-          : {}),
-        ...optionalTaskFields(finalAssigneeGid, finalDueDate),
-      },
-    };
+    for (const task of plannedTasks) {
+      const finalAssigneeGid = mergeField(assigneeGid, task.assigneeGid);
+      const finalDueDate = mergeField(dueDate, task.dueDate);
+      const finalProjectGid = task.projectGid || ASANA_PROJECT_GID;
 
-    const r = await fetch(`${ASANA_API}/tasks`, {
-      method: 'POST',
-      headers: asanaHeaders(),
-      body: JSON.stringify(payload),
-    });
-    const body = await r.json();
+      // Only now, once we know which board it's landing on, look up that
+      // board's actual sections and translate the category into a real gid —
+      // never inventing one, and leaving it uncategorized if that board
+      // doesn't have a matching section.
+      const sections = await getProjectSections(finalProjectGid);
+      const sectionGid = sectionGidForCategory(task.category, sections);
 
-    if (!r.ok) {
-      const message = body?.errors?.[0]?.message || 'Asana rejected the request.';
-      return res.status(r.status).json({ error: message });
+      const payload = {
+        data: {
+          name: task.title,
+          notes: task.description,
+          // `projects` is required on every create call (Asana needs it to
+          // infer the workspace) — `memberships` is an *additional* hint on
+          // top of that which places the task directly into a section when
+          // we have a confident match; otherwise it just lands in the
+          // project with no section (the default/uncategorized area), per
+          // "if unsure, don't put it in any section."
+          projects: [finalProjectGid],
+          ...(sectionGid
+            ? { memberships: [{ project: finalProjectGid, section: sectionGid }] }
+            : {}),
+          ...optionalTaskFields(finalAssigneeGid, finalDueDate),
+        },
+      };
+
+      const r = await fetch(`${ASANA_API}/tasks`, {
+        method: 'POST',
+        headers: asanaHeaders(),
+        body: JSON.stringify(payload),
+      });
+      const body = await r.json();
+
+      if (!r.ok) {
+        const message = body?.errors?.[0]?.message || 'Asana rejected the request.';
+        // Keep going with whatever else was planned rather than losing the
+        // whole note just because one ticket in the batch failed — surface
+        // it as a warning instead.
+        warning = warning
+          ? `${warning} Also could not create "${task.title}": ${message}`
+          : `Could not create "${task.title}": ${message}`;
+        continue;
+      }
+
+      const newTaskGid = body?.data?.gid || null;
+      let subtaskCount = 0;
+
+      for (const subtaskTitle of task.subtasks) {
+        const subR = await fetch(`${ASANA_API}/tasks/${newTaskGid}/subtasks`, {
+          method: 'POST',
+          headers: asanaHeaders(),
+          body: JSON.stringify({ data: { name: subtaskTitle } }),
+        });
+        if (subR.ok) {
+          subtaskCount += 1;
+        } else {
+          warning = warning
+            ? `${warning} A subtask on "${task.title}" didn't save — add "${subtaskTitle}" by hand.`
+            : `A subtask on "${task.title}" didn't save — add "${subtaskTitle}" by hand.`;
+        }
+      }
+
+      created.push({
+        title: task.title,
+        taskGid: newTaskGid,
+        taskUrl: taskUrl(finalProjectGid, newTaskGid),
+        subtaskCount,
+      });
     }
 
-    const newTaskGid = body?.data?.gid || null;
+    if (!created.length) {
+      return res.status(502).json({ error: warning || 'Asana rejected every ticket in this note.' });
+    }
+
     res.json({
       ok: true,
-      taskGid: newTaskGid,
-      warning: null,
-      actions: ['created'],
-      taskUrl: taskUrl(finalProjectGid, newTaskGid),
+      warning,
+      actions: created.map(() => 'created'),
+      tasks: created,
+      // Back-compat single-ticket fields, pointing at the first ticket
+      // created — only meaningful when exactly one was created.
+      taskGid: created[0].taskGid,
+      taskUrl: created[0].taskUrl,
     });
   } catch (err) {
     console.error('POST /api/submit failed:', err);

@@ -119,6 +119,28 @@ Once a board is picked, the ticket is also dropped into that board's
 always categorized sections on the one default project — just scoped to
 whichever board it actually landed on.
 
+## Splitting a note into tickets and subtasks
+
+One dictated note doesn't always mean one ticket. The same AI pass now also
+decides:
+
+- **Separate tickets** when the note names two or more genuinely independent
+  things — unrelated errands, different people or topics, anything that
+  would make sense to finish on completely different days. Each one lands as
+  its own ticket (own title, description, assignee, due date, board, and
+  section).
+- **Subtasks on one ticket** when the note describes a single goal made up of
+  smaller steps or milestones (e.g. "get quotes, then pick a contractor,
+  then schedule the install") — those become Asana subtasks under one
+  ticket instead of separate tickets.
+
+Most notes are still just one plain ticket with no subtasks — splitting or
+adding subtasks only happens when the note clearly calls for it; when it's
+a toss-up, it stays as a single ticket (easier to split by hand later than
+to untangle wrongly-separated tickets). If a ticket's subtasks fail to save
+for some reason, the ticket itself still gets created — you'll see a note
+in the app telling you which subtask to add by hand.
+
 After every send, the app now also shows an **Open in Asana** link straight
 to the ticket that was just created or updated, so you're never stuck
 hunting for it.
