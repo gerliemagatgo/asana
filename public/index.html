@@ -271,6 +271,28 @@
     return actions.map((a) => labels[a] || a).join(' · ');
   }
 
+  // Builds the HTML for the status line after a submit. A dictated note can
+  // turn into more than one ticket (or one ticket with subtasks) now, so
+  // this links to each ticket created rather than assuming there's just one.
+  function describeCreatedTasks(tasks) {
+    const withSub = (t) => (t.subtaskCount ? ` (+${t.subtaskCount} subtask${t.subtaskCount === 1 ? '' : 's'})` : '');
+    if (tasks.length === 1) {
+      const t = tasks[0];
+      return t.taskUrl
+        ? `New ticket created${withSub(t)} ✓ — <a href="${t.taskUrl}" target="_blank" rel="noopener">Open in Asana</a>`
+        : `New ticket created${withSub(t)} ✓`;
+    }
+    const links = tasks
+      .map((t, i) => {
+        const label = t.taskUrl
+          ? `<a href="${t.taskUrl}" target="_blank" rel="noopener">${t.title || `Ticket ${i + 1}`}</a>`
+          : t.title || `Ticket ${i + 1}`;
+        return `${label}${withSub(t)}`;
+      })
+      .join(' · ');
+    return `${tasks.length} tickets created ✓ — ${links}`;
+  }
+
   async function loadTickets() {
     try {
       const r = await fetch('/api/tasks', { headers: headers() });
@@ -364,12 +386,22 @@
       });
       const body = await r.json();
       if (!r.ok) throw new Error(body.error || 'Something went wrong.');
-      const summary = body.warning
-        ? `${describeActions(body.actions)} — ${body.warning}`
-        : `${describeActions(body.actions)} ✓`;
-      statusEl.innerHTML = body.taskUrl
-        ? `${summary} — <a href="${body.taskUrl}" target="_blank" rel="noopener">Open in Asana</a>`
-        : summary;
+      const isNewTicket = !ticketEl.value;
+      if (isNewTicket && body.tasks && body.tasks.length) {
+        // A dictated note can turn into more than one ticket (or one ticket
+        // with subtasks), so link to each one created rather than assuming
+        // there's just a single result.
+        statusEl.innerHTML = body.warning
+          ? `${describeCreatedTasks(body.tasks)} — ${body.warning}`
+          : describeCreatedTasks(body.tasks);
+      } else {
+        const summary = body.warning
+          ? `${describeActions(body.actions)} — ${body.warning}`
+          : `${describeActions(body.actions)} ✓`;
+        statusEl.innerHTML = body.taskUrl
+          ? `${summary} — <a href="${body.taskUrl}" target="_blank" rel="noopener">Open in Asana</a>`
+          : summary;
+      }
       statusEl.className = body.warning ? 'status err' : 'status ok';
       textEl.value = '';
     } catch (err) {
