@@ -9,7 +9,11 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="apple-mobile-web-app-title" content="Quick Update" />
-<meta name="theme-color" content="#151515" />
+<meta name="theme-color" content="#f6f6fe" />
+<link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2" />
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=2" />
+<link rel="icon" type="image/png" sizes="64x64" href="/favicon-64.png?v=2" />
+<link rel="manifest" href="/manifest.webmanifest?v=2" />
 
 <style>
   :root {
@@ -414,7 +418,7 @@
 
   // On load: if we already have a saved code, skip straight to the app.
   (async function init() {
-    if (!getCode()) return unlock(false);
+    // Always ask the server: if no access code is required it just opens.
     const check = await fetch('/api/tasks', { headers: headers() });
     if (check.status === 401) {
       localStorage.removeItem(STORAGE_KEY);
