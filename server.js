@@ -11,6 +11,7 @@ const {
   ASANA_TOKEN,
   ASANA_PROJECT_GID,
   ACCESS_CODE,
+  ENFORCE_ACCESS_CODE,
   DRY_RUN,
   PORT,
   ANTHROPIC_API_KEY,
@@ -51,8 +52,14 @@ function asanaHeaders() {
   };
 }
 
+// The access code is OFF by default so the app opens straight to the page
+// (no typing while driving). A leftover ACCESS_CODE variable on the host is
+// ignored unless ENFORCE_ACCESS_CODE is also set to "true".
+const accessCodeEnforced =
+  Boolean(ACCESS_CODE) && String(ENFORCE_ACCESS_CODE).toLowerCase() === 'true';
+
 function requireAccessCode(req, res, next) {
-  if (!ACCESS_CODE) return next(); // access code disabled
+  if (!accessCodeEnforced) return next(); // access code disabled
   const supplied = req.get('x-access-code') || '';
   if (supplied !== ACCESS_CODE) {
     return res.status(401).json({ error: 'Wrong or missing access code.' });
@@ -74,7 +81,7 @@ app.get('/api/health', (req, res) => {
     ok: true,
     dryRun: isDryRun,
     asanaConfigured: Boolean(ASANA_TOKEN && ASANA_PROJECT_GID),
-    accessCodeEnabled: Boolean(ACCESS_CODE),
+    accessCodeEnabled: accessCodeEnforced,
     aiSummarizationConfigured: Boolean(ANTHROPIC_API_KEY),
     aiDailyLimit,
     aiCallsToday: aiCallCount,
