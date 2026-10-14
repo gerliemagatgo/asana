@@ -127,6 +127,7 @@ async function getProjectMembers() {
     return [
       { gid: 'demo-user-1', name: '(dry run) Gerlie' },
       { gid: 'demo-user-2', name: '(dry run) Katie' },
+      { gid: 'demo-user-3', name: '(dry run) Eva' },
     ];
   }
   if (!ASANA_TOKEN || !ASANA_PROJECT_GID) return [];
@@ -304,9 +305,36 @@ function membersForPrompt(members) {
   return members.map((m) => `${m.name} (gid: ${m.gid})`).join('\n');
 }
 
+// Dates are worked out in Mountain Time (Katie's time), not the server's UTC,
+// so "today", "tomorrow" and "by Friday" don't slip a day late in the evening.
+function mountainToday() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Denver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); // YYYY-MM-DD
+}
+
 function todayContext() {
-  const now = new Date();
-  return `${now.toDateString()} (i.e. ${now.toISOString().slice(0, 10)})`;
+  const today = mountainToday();
+  const d = new Date(today + 'T12:00:00Z');
+  return d.toUTCString().slice(0, 16) + ' (i.e. ' + today + ')';
+}
+
+// Next weekday after today (Mountain Time): the fallback due date when a note gives no timing at all.
+function nextBusinessDay() {
+  const d = new Date(mountainToday() + 'T12:00:00Z');
+  do {
+    d.setUTCDate(d.getUTCDate() + 1);
+  } while (d.getUTCDay() === 0 || d.getUTCDay() === 6);
+  return d.toISOString().slice(0, 10);
+}
+
+// Accepts only a real YYYY-MM-DD that is today or later.
+function validFutureDate(s) {
+  return /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(s || '') && !isNaN(Date.parse(s + 'T12:00:00Z')) && s >= mountainToday();
+}
+
+// New tickets default to Eva unless the note clearly assigned someone else.
+function evaGid(members) {
+  const m = (members || []).find((x) => /\beva\b/i.test(x.name));
+  return m ? m.gid : null;
 }
 
 // Claude sometimes wraps JSON replies in a ```json ... ``` code fence even
@@ -414,8 +442,8 @@ async function summarizeUpdate(text, members, projects, defaultProjectGid) {
       `invent a gid and never guess if genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
       'If a task mentions a due date (e.g. "by Friday", "next week", "end of month"), resolve ' +
       `it to an actual date. Today is ${todayContext()}. ` +
-      'If nothing is said about who a task is for or when it is due, leave those fields null — ' +
-      'do not default to assigning it to anyone. ' +
+      'Every task MUST have an assigneeGid and a dueDate — never null. Assignee: default to the member named Eva (Eva Carloss) unless the note EXPLICITLY says the task is for someone else, such as Katie, and you are confident about that; when unsure, use Eva. Due date: decide each task's due date separately from its own wording and context — a single note can contain several tasks with different due dates (for example 'call the plumber today' and 'send the form by next Friday'). Resolve relative phrases like 'tomorrow', 'by Friday', 'end of next week' or 'before the trip on the 22nd' to real dates. If a task has no stated or implied timing, use the next business day (skip weekends). Never return a date in the past. ' +
+      '' +
       'Separately, decide which board/project each task actually belongs on, using ONLY this ' +
       `list — never invent a gid:\n${projectsForPrompt(projects)}\n` +
       `The default board is (gid: ${defaultProjectGid || 'none configured'}) — only set ` +
@@ -549,8 +577,8 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       console.log('[DRY RUN] Would create', preview.length, 'ticket(s):', {
         text: trimmed,
         tasks: preview.map((t) => ({
-          assigneeGid: mergeField(assigneeGid, t.assigneeGid),
-          dueDate: mergeField(dueDate, t.dueDate),
+          assigneeGid: mergeField(assigneeGid, t.assigneeGid) || evaGid(members),
+          dueDate: mergeField(dueDate, validFutureDate(t.dueDate) ? t.dueDate : null) || nextBusinessDay(),
           wouldUseTitle: t.title,
           wouldUseDescription: t.description,
           wouldUseProjectGid: t.projectGid || ASANA_PROJECT_GID,
@@ -651,8 +679,9 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
     let warning = null;
 
     for (const task of plannedTasks) {
-      const finalAssigneeGid = mergeField(assigneeGid, task.assigneeGid);
-      const finalDueDate = mergeField(dueDate, task.dueDate);
+      const finalAssigneeGid = mergeField(assigneeGid, task.assigneeGid) || evaGid(members);
+      const finalDueDate =
+        mergeField(dueDate, validFutureDate(task.dueDate) ? task.dueDate : null) || nextBusinessDay();
       const finalProjectGid = task.projectGid || ASANA_PROJECT_GID;
 
       // Only now, once we know which board it's landing on, look up that
