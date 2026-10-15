@@ -293,8 +293,13 @@ const MAX_SUBTASKS_PER_TASK = 10;
 function sanitizeSubtasks(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
-    .map((s) => String(s || '').trim())
-    .filter(Boolean)
+    .map((s) => {
+      if (s && typeof s === 'object') {
+        return { title: String(s.title || '').trim(), dueDate: s.dueDate || null, assigneeGid: s.assigneeGid || null };
+      }
+      return { title: String(s || '').trim(), dueDate: null, assigneeGid: null };
+    })
+    .filter((s) => s.title)
     .slice(0, MAX_SUBTASKS_PER_TASK);
 }
 
@@ -415,7 +420,7 @@ async function summarizeUpdate(text, members, projects, defaultProjectGid) {
       'Reply with ONLY raw compact JSON and nothing else — no markdown, no code fences, no ' +
       'commentary before or after it: {"tasks": [{"title": "...", "description": "...", ' +
       '"assigneeGid": "..." or null, "dueDate": "YYYY-MM-DD" or null, "projectGid": "..." or ' +
-      'null, "category": "admin" or "adhoc" or "recurring" or "other", "subtasks": ["...", ...]}, ...]}. ' +
+      'null, "category": "admin" or "adhoc" or "recurring" or "other", "subtasks": [{"title": "...", "dueDate": "YYYY-MM-DD", "assigneeGid": "..."}, ...]}, ...]}. ' +
       'First decide how many tickets this note actually describes, using one test: are these ' +
       'things part of the SAME matter, or do they concern a genuinely DIFFERENT matter? Steps, ' +
       'check-ins, sub-parts, or follow-ups that all belong to one underlying matter, person, or ' +
@@ -432,7 +437,7 @@ async function summarizeUpdate(text, members, projects, defaultProjectGid) {
       'For each task: the title is a short, specific summary (under 10 words, no trailing ' +
       'period). The description is that task\'s full context, lightly cleaned up (fix filler ' +
       'words/false starts/transcription glitches) but keeping every real detail — do not ' +
-      'summarize the description, only the title. subtasks are short imperative phrases for ' +
+      'summarize the description, only the title. Subtask titles are short imperative phrases for ' +
       `each milestone/step (e.g. "Get quotes from contractors"), in the order they'd happen — ` +
       'leave it an empty array when the task has no distinct sub-steps worth tracking ' +
       'separately (most of the time). ' +
@@ -442,7 +447,8 @@ async function summarizeUpdate(text, members, projects, defaultProjectGid) {
       `invent a gid and never guess if genuinely no one is a close match:\n${membersForPrompt(members)}\n` +
       'If a task mentions a due date (e.g. "by Friday", "next week", "end of month"), resolve ' +
       `it to an actual date. Today is ${todayContext()}. ` +
-      'Every task MUST have an assigneeGid and a dueDate — never null. Assignee: default to the member named Eva (Eva Carloss) unless the note EXPLICITLY says the task is for someone else, such as Katie, and you are confident about that; when unsure, use Eva. Due date: decide each task's due date separately from its own wording and context — a single note can contain several tasks with different due dates (for example 'call the plumber today' and 'send the form by next Friday'). Resolve relative phrases like 'tomorrow', 'by Friday', 'end of next week' or 'before the trip on the 22nd' to real dates. If a task has no stated or implied timing, use the next business day (skip weekends). Never return a date in the past. ' +
+      'Every task MUST have an assigneeGid and a dueDate, never null. Assignee: default to the member named Eva (Eva Carloss) unless the note EXPLICITLY says the task is for someone else, such as Katie, and you are confident about that; when unsure, use Eva. Due date: decide each tasks due date separately from its own wording and context. A single note can contain several tasks with different due dates (for example "call the plumber today" and "send the form by next Friday"); give each task its own date, and never copy one date onto every task unless the note says so. Resolve relative phrases like "tomorrow", "by Friday", "end of next week" or "before the trip on the 22nd" to real dates. If a task has no stated or implied timing, use the next business day (skip weekends). Never return a date in the past. ' +
+      'Every subtask is an object with its own title, dueDate and assigneeGid. A subtask gets its own due date from its own wording (for example "call the plumber today" as a step is due today even if the main task is due Friday); if a subtask has no timing of its own, use the same dueDate as its parent task. A subtask is assigned to the same person as its parent task unless the note clearly says someone else should do that step. ' +
       '' +
       'Separately, decide which board/project each task actually belongs on, using ONLY this ' +
       `list — never invent a gid:\n${projectsForPrompt(projects)}\n` +
@@ -540,6 +546,17 @@ function mergeField(explicitValue, aiValue) {
   return explicitValue || aiValue || null;
 }
 
+// Stamps where a ticket came from, at the top of its description, so anyone
+// looking at it in Asana can tell it was dictated through this app.
+function withSource(description) {
+  const when = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Denver',
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date());
+  return `Source: Quick Update voice app (dictated note, ${when} MT)\n\n${description}`;
+}
+
 // A direct link to the task, so the app can show "Open in Asana" right after
 // sending instead of making someone go hunt for what just got created.
 function taskUrl(projectGid, taskGid) {
@@ -577,7 +594,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       console.log('[DRY RUN] Would create', preview.length, 'ticket(s):', {
         text: trimmed,
         tasks: preview.map((t) => ({
-          assigneeGid: mergeField(assigneeGid, t.assigneeGid) || evaGid(members),
+          assigneeGid: mergeField(assigneeGid, t.assigneeGid) || evaGid(members) || 'me',
           dueDate: mergeField(dueDate, validFutureDate(t.dueDate) ? t.dueDate : null) || nextBusinessDay(),
           wouldUseTitle: t.title,
           wouldUseDescription: t.description,
@@ -622,7 +639,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         const storyR = await fetch(`${ASANA_API}/tasks/${taskGid}/stories`, {
           method: 'POST',
           headers: asanaHeaders(),
-          body: JSON.stringify({ data: { text: trimmed } }),
+          body: JSON.stringify({ data: { text: `[Quick Update voice app] ${trimmed}` } }),
         });
         if (!storyR.ok) {
           const storyBody = await storyR.json().catch(() => ({}));
@@ -679,7 +696,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
     let warning = null;
 
     for (const task of plannedTasks) {
-      const finalAssigneeGid = mergeField(assigneeGid, task.assigneeGid) || evaGid(members);
+      const finalAssigneeGid = mergeField(assigneeGid, task.assigneeGid) || evaGid(members) || 'me';
       const finalDueDate =
         mergeField(dueDate, validFutureDate(task.dueDate) ? task.dueDate : null) || nextBusinessDay();
       const finalProjectGid = task.projectGid || ASANA_PROJECT_GID;
@@ -694,7 +711,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       const payload = {
         data: {
           name: task.title,
-          notes: task.description,
+          notes: withSource(task.description),
           // `projects` is required on every create call (Asana needs it to
           // infer the workspace) — `memberships` is an *additional* hint on
           // top of that which places the task directly into a section when
@@ -730,18 +747,20 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       const newTaskGid = body?.data?.gid || null;
       let subtaskCount = 0;
 
-      for (const subtaskTitle of task.subtasks) {
+      for (const sub of task.subtasks) {
+        const subAssigneeGid = members.some((m) => m.gid === sub.assigneeGid) ? sub.assigneeGid : finalAssigneeGid;
+        const subDueDate = validFutureDate(sub.dueDate) ? sub.dueDate : finalDueDate;
         const subR = await fetch(`${ASANA_API}/tasks/${newTaskGid}/subtasks`, {
           method: 'POST',
           headers: asanaHeaders(),
-          body: JSON.stringify({ data: { name: subtaskTitle } }),
+          body: JSON.stringify({ data: { name: sub.title, ...optionalTaskFields(subAssigneeGid, subDueDate) } }),
         });
         if (subR.ok) {
           subtaskCount += 1;
         } else {
           warning = warning
-            ? `${warning} A subtask on "${task.title}" didn't save — add "${subtaskTitle}" by hand.`
-            : `A subtask on "${task.title}" didn't save — add "${subtaskTitle}" by hand.`;
+            ? `${warning} A subtask on "${task.title}" didn't save — add "${sub.title}" by hand.`
+            : `A subtask on "${task.title}" didn't save — add "${sub.title}" by hand.`;
         }
       }
 
