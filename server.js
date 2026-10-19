@@ -557,6 +557,33 @@ function withSource(description) {
   return `Source: Quick Update voice app (dictated note, ${when} MT)\n\n${description}`;
 }
 
+// Saves the exact text that was sent, as a comment on the new ticket, so the
+// original wording is never lost (the ticket description is a cleaned-up
+// version). Best effort: a failure here must never block the ticket itself.
+async function addOriginalDictationComment(taskGid, rawText) {
+  if (!taskGid) return false;
+  try {
+    const when = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Denver',
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date());
+    const r = await fetch(`${ASANA_API}/tasks/${taskGid}/stories`, {
+      method: 'POST',
+      headers: asanaHeaders(),
+      body: JSON.stringify({
+        data: {
+          text: `[Quick Update voice app] Original dictation (${when} MT), exactly as received:\n\n${rawText.slice(0, 20000)}`,
+        },
+      }),
+    });
+    return r.ok;
+  } catch (err) {
+    console.error('Could not save original dictation comment:', err);
+    return false;
+  }
+}
+
 // A direct link to the task, so the app can show "Open in Asana" right after
 // sending instead of making someone go hunt for what just got created.
 function taskUrl(projectGid, taskGid) {
@@ -764,6 +791,13 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
         }
       }
 
+      const savedOriginal = await addOriginalDictationComment(newTaskGid, trimmed);
+      if (!savedOriginal) {
+        warning = warning
+          ? `${warning} The original wording of "${task.title}" wasn't saved as a comment.`
+          : `The original wording of "${task.title}" wasn't saved as a comment.`;
+      }
+
       created.push({
         title: task.title,
         taskGid: newTaskGid,
@@ -787,7 +821,7 @@ app.post('/api/submit', requireAccessCode, async (req, res) => {
       taskUrl: created[0].taskUrl,
     });
   } catch (err) {
-    console.error('POST /api/submit failed:', err);
+    console.error('POST /api/submit failed:', err, '| Original text was:', trimmed);
     res.status(502).json({ error: 'Could not reach Asana. Try again in a moment.' });
   }
 });
